@@ -1,0 +1,70 @@
+name: Build CYD Firmware
+
+# Compiles shabbat_countdown_cyd/shabbat_countdown_cyd.ino with arduino-cli
+# and drops the flash-ready binaries into web-flasher/firmware/, so the
+# GitHub Pages-hosted web flasher always serves whatever's on main. No
+# desktop Arduino IDE or manual "Export Compiled Binary" step required —
+# push a sketch change and this does it.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'shabbat_countdown_cyd/shabbat_countdown_cyd.ino'
+      - '.github/workflows/build-firmware.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install \
+            "Adafruit GFX Library" \
+            "Adafruit ILI9341" \
+            "XPT2046_Touchscreen" \
+            "ArduinoJson"
+
+      - name: Compile (ESP32 Dev Module, i.e. the plain ESP32 the CYD uses)
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32 \
+            --export-binaries \
+            shabbat_countdown_cyd
+
+      - name: Collect firmware binaries for the web flasher
+        run: |
+          mkdir -p web-flasher/firmware
+          BUILD_DIR=shabbat_countdown_cyd/build/esp32.esp32.esp32
+          cp "$BUILD_DIR/shabbat_countdown_cyd.ino.bin"          web-flasher/firmware/firmware.bin
+          cp "$BUILD_DIR/shabbat_countdown_cyd.ino.bootloader.bin" web-flasher/firmware/bootloader.bin
+          cp "$BUILD_DIR/shabbat_countdown_cyd.ino.partitions.bin" web-flasher/firmware/partitions.bin
+          # boot_app0.bin isn't exported by arduino-cli — it's a static file
+          # bundled with the ESP32 core itself; find and copy it directly.
+          BOOT_APP0=$(find ~/.arduino15/packages/esp32 -name boot_app0.bin | head -n1)
+          cp "$BOOT_APP0" web-flasher/firmware/boot_app0.bin
+
+      - name: Commit updated firmware binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add web-flasher/firmware
+          git diff --cached --quiet || git commit -m "Auto-build: update CYD firmware binaries [skip ci]"
+          git push
