@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shabbat Countdown — CYD Flasher</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root {
+      --panel: #0a2733;
+      --panel-edge: #00719f;
+      --accent: #d65f22;
+      --accent-dim: #6b2f11;
+      --info: #cfe8f0;
+      --bg: #06141a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--info);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      justify-content: center;
+      padding: 32px 16px 64px;
+    }
+    main {
+      width: 100%;
+      max-width: 640px;
+    }
+    h1 {
+      color: var(--accent);
+      font-size: 1.6rem;
+      margin-bottom: 4px;
+    }
+    .sub {
+      color: var(--info);
+      opacity: 0.75;
+      margin-top: 0;
+      margin-bottom: 28px;
+      font-size: 0.95rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--panel-edge);
+      border-radius: 12px;
+      padding: 20px 22px;
+      margin-bottom: 20px;
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 1.05rem;
+      color: var(--info);
+    }
+    .card p, .card li {
+      font-size: 0.92rem;
+      line-height: 1.5;
+      color: var(--info);
+      opacity: 0.9;
+    }
+    .card ol, .card ul { padding-left: 1.2em; }
+    code {
+      background: rgba(0,0,0,0.35);
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 0.88em;
+    }
+    esp-web-install-button {
+      display: block;
+      margin: 8px 0 4px;
+    }
+    esp-web-install-button button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 12px 22px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    esp-web-install-button button:hover { filter: brightness(1.08); }
+    .unsupported {
+      display: none;
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 0.9rem;
+    }
+    footer {
+      text-align: center;
+      font-size: 0.8rem;
+      opacity: 0.55;
+      margin-top: 32px;
+    }
+    a { color: var(--panel-edge); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Shabbat Countdown — CYD Flasher</h1>
+    <p class="sub">Flash the ShabbatCon countdown clock firmware straight from your browser — no software to install.</p>
+
+    <div class="card">
+      <h2>Before you flash</h2>
+      <ol>
+        <li>Use <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer (Web Serial isn't available in Safari, Firefox, or on most mobile browsers).</li>
+        <li>Connect your CYD (Cheap Yellow Display, Sunton ESP32-2432S028R) board with a USB cable that carries data — some cables are charge-only.</li>
+        <li>Click the button below, pick the board's serial port when prompted, and follow the on-screen steps.</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>Install firmware</h2>
+      <esp-web-install-button manifest="./manifest.json">
+        <button slot="activate">Connect &amp; Flash</button>
+        <span slot="unsupported" class="unsupported" style="display:block;">
+          Your browser doesn't support Web Serial. Please open this page in
+          <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer instead.
+        </span>
+        <span slot="not-allowed" class="unsupported" style="display:block;">
+          This page needs to be served over <strong>HTTPS</strong> (GitHub Pages is) —
+          Web Serial is blocked on plain HTTP.
+        </span>
+      </esp-web-install-button>
+    </div>
+
+    <div class="card">
+      <h2>After flashing</h2>
+      <p>
+        The device boots with no Wi-Fi network configured. Tap the wrench icon in the
+        top-right corner, choose <strong>WI-FI</strong>, and enter your network name and
+        password on the on-screen keyboard — they're saved to that device's own storage,
+        never baked into the firmware, so this same public build works for anyone.
+      </p>
+      <p>
+        From that same settings menu you can also set your ZIP code, brightness, the
+        havdalah offset, and the device's clock.
+      </p>
+    </div>
+
+    <footer>
+      Firmware built automatically from the CYD sketch in this project's
+      GitHub repo — see the repo README for details.
+      <!-- Pages only serves this web-flasher/ folder, so a relative link to
+           the sketch one level up won't resolve here — link to your repo's
+           GitHub blob URL instead if you want a working link. -->
+    </footer>
+  </main>
+</body>
+</html>
