@@ -85,13 +85,14 @@
 // digits are hand-drawn from rectangles (drawSevenSegDigit), not text, so
 // they're unaffected by font choice and keep their blocky LED look.
 #include <math.h>
+#include "cities.h" // 250 major world cities, for picking a location without a US ZIP code
 
 // These are declared this early (right after the includes) because the
 // Arduino build system auto-generates function prototypes and inserts them
 // immediately after the last #include — before any type defined later in
 // this file would otherwise be visible. Several functions take these enums
 // as parameters, so they have to exist before that insertion point.
-enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_KEYPAD, SCR_BRIGHTNESS, SCR_TEXTPAD };
+enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_KEYPAD, SCR_BRIGHTNESS, SCR_TEXTPAD, SCR_CITY_LIST };
 enum KeypadPurpose { KP_ZIP, KP_HAVDALAH, KP_YEAR, KP_MONTH, KP_DAY, KP_HOUR, KP_MINUTE };
 // Alphanumeric text entry (Wi-Fi SSID/password) is a separate keyboard
 // screen from the numeric keypad above, since it needs letters and symbols.
@@ -176,6 +177,9 @@ bool hasUtcOffset = false;
 String currentSsid = "";
 String currentPass = "";
 bool hasWifiCreds = false; // false until a real SSID has been saved (see Settings > WI-FI)
+bool usingCity = false;      // true if the location came from the CITY list rather than a ZIP
+String currentCityLabel = ""; // short "City" name shown in the header when usingCity is true
+int cityListTop = 0;          // index of the first visible row in the CITY list screen
 
 // ---------------- Runtime state ----------------
 time_t candleLightingEpoch = 0;
@@ -505,14 +509,18 @@ void loadSettings() {
   currentSsid = prefs.getString("ssid", WIFI_SSID);
   currentPass = prefs.getString("pass", WIFI_PASS);
   hasWifiCreds = currentSsid.length() > 0 && currentSsid != "YOUR_WIFI_SSID";
+  usingCity = prefs.getBool("usingCity", false);
+  currentCityLabel = prefs.getString("cityLbl", "");
   prefs.end();
 }
 
 void saveZip(const String &zip) {
   prefs.begin("shabbat", false);
   prefs.putString("zip", zip);
+  prefs.putBool("usingCity", false); // switch the header back to ZIP display
   prefs.end();
   currentZip = zip;
+  usingCity = false;
 }
 
 void saveCoords(double lat, double lon) {
@@ -522,6 +530,43 @@ void saveCoords(double lat, double lon) {
   prefs.putBool("hasCoords", true);
   prefs.end();
   hasCoords = true;
+}
+
+// Picks a location from the built-in CITY_LIST (cities.h) instead of a US
+// ZIP code — the ZIP->lat/lon lookup (api.zippopotam.us) only covers US
+// ZIP codes, so this is the path for everyone else. No network lookup is
+// needed at all, since the list already carries lat/lon.
+void selectCity(int idx) {
+  if (idx < 0 || idx >= CITY_COUNT) return;
+  latitude = CITY_LIST[idx].lat;
+  longitude = CITY_LIST[idx].lon;
+
+  String full = CITY_LIST[idx].name;
+  int comma = full.indexOf(',');
+  currentCityLabel = (comma >= 0) ? full.substring(0, comma) : full;
+  currentCityLabel.toUpperCase();
+  usingCity = true;
+
+  prefs.begin("shabbat", false);
+  prefs.putDouble("lat", latitude);
+  prefs.putDouble("lon", longitude);
+  prefs.putBool("hasCoords", true);
+  prefs.putBool("usingCity", true);
+  prefs.putString("cityLbl", currentCityLabel);
+  prefs.end();
+
+  hasCoords = true;
+  needsGeocode = false; // no ZIP lookup needed — we already have lat/lon
+  candleLightingEpoch = 0;
+  havdalahEpoch = 0;
+  if (hasWallClock) {
+    if (!hasUtcOffset) {
+      localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600;
+      saveUtcOffset();
+    }
+    computeShabbatTimes();
+  }
+  screenNeedsFullRedraw = true;
 }
 
 void saveHavdalahOffset() {
@@ -740,7 +785,7 @@ void drawStaticUI() {
 
   drawCandleIcon(8, 14);
   drawCandleIcon(18, 14);
-  String zipText = "ZIP " + currentZip;
+  String zipText = usingCity ? currentCityLabel : ("ZIP " + currentZip);
   tft.setFont(&FreeSansBold9pt7b);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_ZIP_TEXT, COLOR_PANEL);
@@ -783,6 +828,19 @@ void drawHeaderTime() {
   tft.setFont();
 }
 
+// Draws a D/HH/MM/SS caption centered under a digit group, using the actual
+// measured text width rather than a fixed offset, so "D" (one digit wide)
+// and "HH"/"MM"/"SS" (two digits + the gap between them wide) all land
+// centered under their own group regardless of how many characters they are.
+void drawDigitGroupLabel(const char* label, int groupX, int groupW, int y) {
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ACCENT_DIM, COLOR_BG);
+  int16_t lbx, lby; uint16_t lbw, lbh;
+  tft.getTextBounds(label, 0, 0, &lbx, &lby, &lbw, &lbh);
+  tft.setCursor(groupX + (groupW - (int)lbw) / 2 - lbx, y);
+  tft.print(label);
+}
+
 void drawCountdownFrame() {
   tft.fillRect(0, 30, 320, 190, COLOR_BG);
 
@@ -814,27 +872,37 @@ void drawCountdownFrame() {
   String candleLine = "CANDLES " + formatLocalTime(candleLightingEpoch);
   String havdalahLine = "HAVDALAH " + formatLocalTime(havdalahEpoch);
 
-  // Two lines, center-justified, evenly distributed across the remaining
-  // space below the clock frame down to the bottom of the content area.
+  // Two lines, center-justified, vertically centered together as one block
+  // in the remaining space below the clock frame down to the bottom of the
+  // content area — rather than each line centered in its own half, which
+  // could visually skew the pair off-center as a group.
   int areaTop = fy1 + 8;     // just under the frame
   int areaBottom = 216;      // near the bottom of the drawable content region
-  int half = (areaBottom - areaTop) / 2;
-  int line1Y = areaTop + half / 2 - 8;          // -8: half the size-2 text height
-  int line2Y = areaTop + half + half / 2 - 8;
+  int areaHeight = areaBottom - areaTop;
+
+  tft.setFont(chromeFont(2));
+  tft.setTextSize(1);
+  int16_t mbx, mby; uint16_t mbw, mbh;
+  tft.getTextBounds(candleLine.c_str(), 0, 0, &mbx, &mby, &mbw, &mbh);
+  tft.setFont();
+
+  int lineH = (int)mbh;
+  int lineGap = 8;
+  int blockH = lineH * 2 + lineGap;
+  int blockTop = areaTop + (areaHeight - blockH) / 2;
+  int line1Y = blockTop;
+  int line2Y = blockTop + lineH + lineGap;
 
   printCentered(candleLine.c_str(), 160, line1Y, 2, COLOR_INFO, COLOR_BG);
   printCentered(havdalahLine.c_str(), 160, line2Y, 2, COLOR_INFO, COLOR_BG);
 
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_ACCENT_DIM, COLOR_BG);
-  tft.setCursor(digitX[0] + 6, CLOCK_Y + DIGIT_H + 8);
-  tft.print("D");
-  tft.setCursor(digitX[1] + 6, CLOCK_Y + DIGIT_H + 8);
-  tft.print("HH");
-  tft.setCursor(digitX[3] + 6, CLOCK_Y + DIGIT_H + 8);
-  tft.print("MM");
-  tft.setCursor(digitX[5] + 6, CLOCK_Y + DIGIT_H + 8);
-  tft.print("SS");
+  // D / HH / MM / SS labels, each centered under its digit group rather than
+  // left-anchored at a fixed offset.
+  int hhGroupW = DIGIT_W * 2 + SEG_GAP;
+  drawDigitGroupLabel("D",  digitX[0], DIGIT_W,   CLOCK_Y + DIGIT_H + 8);
+  drawDigitGroupLabel("HH", digitX[1], hhGroupW, CLOCK_Y + DIGIT_H + 8);
+  drawDigitGroupLabel("MM", digitX[3], hhGroupW, CLOCK_Y + DIGIT_H + 8);
+  drawDigitGroupLabel("SS", digitX[5], hhGroupW, CLOCK_Y + DIGIT_H + 8);
 
   drawColons();
   updateClockDigits(0, 0, 0, 0, 0, 0, 0, true);
@@ -868,29 +936,93 @@ void updateCountdown() {
 // =========================================================================
 // Screen drawing: settings menu
 // =========================================================================
+// =========================================================================
+// Screen: CITY list — an alternative to typing a ZIP code, since the ZIP
+// lookup only covers the US. Shows 6 rows at a time; the up/down arrows on
+// the right page by a full screen, and tapping a row selects that city
+// immediately (no separate OK step needed — a tap already is the "select").
+// =========================================================================
+#define CITY_ROWS_VISIBLE 6
+#define CITY_ROW_H 30
+
+void drawCityListScreen() {
+  tft.fillScreen(COLOR_BG);
+  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
+  printCentered("SELECT CITY", 160, 4, 1, COLOR_INFO, COLOR_PANEL);
+
+  for (int i = 0; i < CITY_ROWS_VISIBLE; i++) {
+    int idx = cityListTop + i;
+    if (idx >= CITY_COUNT) break;
+    int y = 30 + i * CITY_ROW_H;
+    tft.fillRoundRect(10, y, 258, CITY_ROW_H - 3, 5, COLOR_PANEL);
+    tft.drawRoundRect(10, y, 258, CITY_ROW_H - 3, 5, COLOR_PANEL_EDGE);
+    printCentered(CITY_LIST[idx].name, 139, y + 6, 1, COLOR_INFO, COLOR_PANEL);
+  }
+
+  tft.fillRoundRect(276, 30, 34, 88, 6, COLOR_PANEL);
+  tft.drawRoundRect(276, 30, 34, 88, 6, COLOR_PANEL_EDGE);
+  printCentered("^", 293, 46, 2, COLOR_INFO, COLOR_PANEL);
+  tft.fillRoundRect(276, 122, 34, 88, 6, COLOR_PANEL);
+  tft.drawRoundRect(276, 122, 34, 88, 6, COLOR_PANEL_EDGE);
+  printCentered("v", 293, 138, 2, COLOR_INFO, COLOR_PANEL);
+
+  tft.fillRoundRect(110, 210, 100, 26, 8, COLOR_ACCENT);
+  printCentered("BACK", 160, 215, 1, COLOR_BG, COLOR_ACCENT);
+}
+
+void handleCityListTouch(int16_t x, int16_t y) {
+  if (x >= 276 && x <= 310) {
+    if (y >= 30 && y <= 118) {
+      cityListTop = max(0, cityListTop - CITY_ROWS_VISIBLE);
+      drawCityListScreen();
+    } else if (y >= 122 && y <= 210) {
+      int maxTop = CITY_COUNT - CITY_ROWS_VISIBLE;
+      if (maxTop < 0) maxTop = 0;
+      cityListTop = min(maxTop, cityListTop + CITY_ROWS_VISIBLE);
+      drawCityListScreen();
+    }
+    return;
+  }
+  if (x >= 110 && x <= 210 && y >= 210 && y <= 236) {
+    screen = SCR_SETTINGS;
+    drawSettingsMenu();
+    return;
+  }
+  if (x >= 10 && x <= 268 && y >= 30 && y < 30 + CITY_ROWS_VISIBLE * CITY_ROW_H) {
+    int row = (y - 30) / CITY_ROW_H;
+    int idx = cityListTop + row;
+    if (idx < CITY_COUNT) {
+      selectCity(idx);
+      screen = SCR_CLOCK;
+      drawStaticUI();
+    }
+  }
+}
+
 void drawSettingsMenu() {
   tft.fillScreen(COLOR_BG);
   tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
   tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
   printCentered("SETTINGS", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
 
-  // Six rows now (Wi-Fi added) — a bit shorter/tighter than the original
-  // five-row layout so they still all fit within the 240px screen height.
-  const char* labels[6] = { "ZIP CODE", "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "BACK" };
-  for (int i = 0; i < 6; i++) {
-    int y = 30 + i * 34;
-    bool isBack = (i == 5);
-    tft.fillRoundRect(20, y, 280, 30, 8, COLOR_PANEL);
-    tft.drawRoundRect(20, y, 280, 30, 8, isBack ? COLOR_ACCENT : COLOR_PANEL_EDGE);
-    printCentered(labels[i], 160, y + 8, 2, isBack ? COLOR_ACCENT : COLOR_INFO, COLOR_PANEL);
+  // Seven rows now (CITY added alongside ZIP CODE) — tighter spacing than
+  // the six-row layout so they still all fit within the 240px screen height.
+  const char* labels[7] = { "ZIP CODE", "CITY", "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "BACK" };
+  for (int i = 0; i < 7; i++) {
+    int y = 30 + i * 29;
+    bool isBack = (i == 6);
+    tft.fillRoundRect(20, y, 280, 26, 7, COLOR_PANEL);
+    tft.drawRoundRect(20, y, 280, 26, 7, isBack ? COLOR_ACCENT : COLOR_PANEL_EDGE);
+    printCentered(labels[i], 160, y + 6, 2, isBack ? COLOR_ACCENT : COLOR_INFO, COLOR_PANEL);
   }
 }
 
 int settingsMenuHit(int16_t x, int16_t y) {
   if (x < 20 || x > 300) return -1;
-  for (int i = 0; i < 6; i++) {
-    int ry = 30 + i * 34;
-    if (y >= ry && y <= ry + 30) return i;
+  for (int i = 0; i < 7; i++) {
+    int ry = 30 + i * 29;
+    if (y >= ry && y <= ry + 26) return i;
   }
   return -1;
 }
@@ -908,11 +1040,12 @@ void handleSettingsTouch(int16_t x, int16_t y) {
   if (hit < 0) return;
   switch (hit) {
     case 0: startKeypad(KP_ZIP, 5); break;
-    case 1: startTextEntry(TXT_SSID, 32, currentSsid); break;
-    case 2: screen = SCR_BRIGHTNESS; drawBrightnessScreen(); break;
-    case 3: startKeypad(KP_YEAR, 4); break;
-    case 4: startKeypad(KP_HAVDALAH, 3); break;
-    case 5: screen = SCR_CLOCK; drawStaticUI(); break;
+    case 1: cityListTop = 0; screen = SCR_CITY_LIST; drawCityListScreen(); break;
+    case 2: startTextEntry(TXT_SSID, 32, currentSsid); break;
+    case 3: screen = SCR_BRIGHTNESS; drawBrightnessScreen(); break;
+    case 4: startKeypad(KP_YEAR, 4); break;
+    case 5: startKeypad(KP_HAVDALAH, 3); break;
+    case 6: screen = SCR_CLOCK; drawStaticUI(); break;
   }
 }
 
@@ -1349,6 +1482,10 @@ void loop() {
 
     case SCR_TEXTPAD:
       if (pressed) handleTextPadTouch(x, y);
+      break;
+
+    case SCR_CITY_LIST:
+      if (pressed) handleCityListTouch(x, y);
       break;
   }
 }
