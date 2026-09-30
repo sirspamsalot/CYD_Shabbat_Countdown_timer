@@ -69,6 +69,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -494,6 +495,33 @@ bool fetchTimezoneFromIP() {
   return true;
 }
 
+// Called whenever the user explicitly picks a ZIP or CITY (from doGeocode()
+// and selectCity() below). Unlike fetchTimezoneFromIP() — which is just an
+// initial best-guess based on the device's own network location — this
+// ALWAYS overrides the current offset, because the user just told us the
+// real location they want times for, which may differ from wherever the
+// device's Wi-Fi network physically is.
+bool fetchTimezoneForCoords(double lat, double lon) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  String url = "https://timeapi.io/api/timezone/coordinate?latitude=" + String(lat, 6) + "&longitude=" + String(lon, 6);
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, payload)) return false;
+  if (!doc.containsKey("currentUtcOffset") || !doc["currentUtcOffset"].containsKey("seconds")) return false;
+
+  localUtcOffsetSeconds = doc["currentUtcOffset"]["seconds"].as<long>();
+  saveUtcOffset();
+  return true;
+}
+
 void doGeocode() {
   tft.fillRect(0, 30, 320, 190, COLOR_BG);
   printCentered("LOCATING...", 160, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
@@ -501,8 +529,12 @@ void doGeocode() {
     saveCoords(latitude, longitude);
     needsGeocode = false;
     if (hasWallClock) {
-      if (!hasUtcOffset) {
-        localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback
+      // Always re-derive the timezone for this newly-picked location — it
+      // may be a different timezone than wherever the device's own Wi-Fi
+      // network is, so the earlier IP-based guess (or a previous ZIP/city's
+      // offset) must not be left in place.
+      if (!fetchTimezoneForCoords(latitude, longitude)) {
+        localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
         saveUtcOffset();
       }
       computeShabbatTimes();
@@ -606,8 +638,12 @@ void selectCity(int idx) {
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
   if (hasWallClock) {
-    if (!hasUtcOffset) {
-      localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600;
+    // Always re-derive the timezone for this newly-picked location — it
+    // may be a different timezone than wherever the device's own Wi-Fi
+    // network is, so the earlier IP-based guess (or a previous ZIP/city's
+    // offset) must not be left in place.
+    if (!fetchTimezoneForCoords(latitude, longitude)) {
+      localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
       saveUtcOffset();
     }
     computeShabbatTimes();
@@ -945,7 +981,7 @@ void drawCountdownFrame() {
     return;
   }
 
-  printCentered("TIME REMAINING", 160, 38, 3, COLOR_ACCENT, COLOR_BG);
+  printCentered("TIME REMAINING", 160, 40, 3, COLOR_ACCENT, COLOR_BG);
 
   int fx0 = digitX[0] - 14, fy0 = CLOCK_Y - 12;
   int fx1 = digitX[6] + DIGIT_W + 14, fy1 = CLOCK_Y + DIGIT_H + 22;
