@@ -217,7 +217,7 @@ String pendingSsid = ""; // holds the SSID between the SSID and password steps
 // Set to 1 to print raw touch ADC coordinates in the corner of the screen
 // on every tap, for recalibrating the four constants above. Leave at 0
 // for normal use.
-#define TOUCH_DEBUG 0
+#define TOUCH_DEBUG 1
 
 bool touchInit() {
   ts.begin(tftSPI); // shares the display's SPI bus; touch has its own CS/IRQ pins
