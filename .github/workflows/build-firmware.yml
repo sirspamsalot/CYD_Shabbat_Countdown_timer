@@ -1,6 +1,6 @@
 name: Build Firmware
 
-# Compiles both hardware targets with arduino-cli:
+# Compiles all three touchscreen/button hardware targets with arduino-cli:
 #   - shabbat_countdown_cyd (CYD, plain ESP32) — binaries land in
 #     web-flasher/firmware/ so the GitHub Pages-hosted browser flasher
 #     always serves whatever's on main.
@@ -8,6 +8,9 @@ name: Build Firmware
 #     land in BOTH epaper-firmware/ (for manual esptool flashing) and
 #     web-flasher/firmware-epaper/ (so the same browser flasher page can
 #     offer it too, via web-flasher/epaper-manifest.json).
+#   - shabbat_countdown_esp32_32e (LCDWiki 4.0" ESP32-32E, ST7796) — binaries
+#     land in web-flasher/firmware-esp32-32e/, via
+#     web-flasher/esp32-32e-manifest.json.
 # No desktop Arduino IDE or manual "Export Compiled Binary" step required —
 # push a sketch change and this does it.
 
@@ -17,6 +20,9 @@ on:
     paths:
       - 'shabbat_countdown_cyd/shabbat_countdown_cyd.ino'
       - 'shabbat_countdown_epaper/shabbat_countdown_epaper.ino'
+      - 'shabbat_countdown_esp32_32e/shabbat_countdown_esp32_32e.ino'
+      - 'shabbat_countdown_esp32_32e/Adafruit_ST7796S_kbv.h'
+      - 'shabbat_countdown_esp32_32e/Adafruit_ST7796S_kbv.cpp'
       - '.github/workflows/build-firmware.yml'
   workflow_dispatch: {}
 
@@ -68,6 +74,18 @@ jobs:
             -v \
             shabbat_countdown_cyd
 
+      - name: Compile ESP32-32E sketch (ESP32 Dev Module, same as CYD)
+        # The ST7796 driver (Adafruit_ST7796S_kbv.h/.cpp) is vendored directly
+        # in this sketch's folder, not installed as a library — arduino-cli
+        # picks up .h/.cpp files sitting next to the .ino automatically, same
+        # as the Arduino IDE does, so no extra install step is needed for it.
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32 \
+            --export-binaries \
+            -v \
+            shabbat_countdown_esp32_32e
+
       - name: Compile e-paper sketch (ESP32S3 Dev Module, PSRAM enabled)
         # PSRAM=opi assumes the "octal" PSRAM variant (matches the
         # ESP32-S3-WROOM-1-N8R8 module this board uses); if the ESP32
@@ -93,6 +111,16 @@ jobs:
           BOOT_APP0=$(find ~/.arduino15/packages/esp32 -name boot_app0.bin | head -n1)
           cp "$BOOT_APP0" web-flasher/firmware/boot_app0.bin
 
+      - name: Collect ESP32-32E firmware binaries for the web flasher
+        run: |
+          mkdir -p web-flasher/firmware-esp32-32e
+          BUILD_DIR=shabbat_countdown_esp32_32e/build/esp32.esp32.esp32
+          cp "$BUILD_DIR/shabbat_countdown_esp32_32e.ino.bin"          web-flasher/firmware-esp32-32e/firmware.bin
+          cp "$BUILD_DIR/shabbat_countdown_esp32_32e.ino.bootloader.bin" web-flasher/firmware-esp32-32e/bootloader.bin
+          cp "$BUILD_DIR/shabbat_countdown_esp32_32e.ino.partitions.bin" web-flasher/firmware-esp32-32e/partitions.bin
+          BOOT_APP0=$(find ~/.arduino15/packages/esp32 -name boot_app0.bin | head -n1)
+          cp "$BOOT_APP0" web-flasher/firmware-esp32-32e/boot_app0.bin
+
       - name: Collect e-paper firmware binaries
         run: |
           mkdir -p epaper-firmware web-flasher/firmware-epaper
@@ -109,6 +137,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add web-flasher/firmware web-flasher/firmware-epaper epaper-firmware
+          git add web-flasher/firmware web-flasher/firmware-epaper epaper-firmware web-flasher/firmware-esp32-32e
           git diff --cached --quiet || git commit -m "Auto-build: update firmware binaries [skip ci]"
           git push
