@@ -1,5 +1,12 @@
 # Shabbat Countdown — CYD + Web Flasher
 
+This is a shabbat candle-lighting/havdalah countdown clock using  the **CYD** ("Cheap Yellow Display", Sunton ESP32-2432S028R) plus a browser-based flasher, so anyone with the right board can flash it.
+
+![Mid-week screenshot of the countdown clock UI](web-flasher/screenshot.png)
+
+*A mockup of the on-device UI mid-week, showing the days/hours/minutes/seconds
+remaining until candle-lighting, the ShabbatCon blue/orange color scheme, and
+the header's ZIP code + live clock.*
 
 ## Layout
 
