@@ -53,8 +53,19 @@
                      quadrature decoding to feel right (missed/doubled
                      steps when turning), that's the thing to revisit.
     Library:        GxEPD2 (by Jean-Marc Zingg), display class
-                     GxEPD2_420_GYE042A87, used in full-buffer mode
-                     (8MB PSRAM makes this easy — no manual paging needed).
+                     GxEPD2_420_GDEY042T81 (src/gdey/ subfolder), used in
+                     full-buffer mode (8MB PSRAM makes this easy — no
+                     manual paging needed). An earlier version of this
+                     sketch referenced GxEPD2_420_GYE042A87, which several
+                     third-party CrowPanel write-ups cite but which was
+                     never actually merged into the GxEPD2 library (it was
+                     only discussed/donated on the GxEPD2 forum, never
+                     shipped) — that name doesn't exist in any released
+                     GxEPD2 version and fails to compile
+                     ("fatal error: ... No such file or directory").
+                     GDEY042T81 is the SSD1683/400x300 4.2" driver that IS
+                     actually in the library, confirmed present at
+                     src/gdey/GxEPD2_420_GDEY042T81.h as of GxEPD2 1.6.9.
 
   IMPORTANT — hardware assumptions flagged for on-device verification,
   same spirit as the CYD sketch's notes: I could not compile-test this
@@ -65,11 +76,16 @@
       below.
     - Screen rotation: display.setRotation(1) is a starting guess for
       landscape. Try 0/2/3 if the image is sideways or mirrored.
-    - GxEPD2_420_GYE042A87 is the exact class documented for this board
-      by a third-party CrowPanel/GxEPD2 write-up; if your installed GxEPD2
-      version names it slightly differently, check the library's
-      "GxEPD2_display_selection_new_style.h" for the closest 400x300
-      SSD1683 entry.
+    - GxEPD2_420_GDEY042T81 should be the correct driver for this panel
+      (SSD1683, 400x300) — if your installed GxEPD2 version names it
+      slightly differently, or the image looks wrong (inverted, ghosting,
+      wrong wavetable), check the library's
+      examples/GxEPD2_Example/GxEPD2_display_selection_new_style.h for the
+      current closest 400x300 SSD1683 entry; GDEY042T81 and GYE042A87 are
+      reportedly near-identical SSD1683 panels that can behave slightly
+      differently under some lighting per community reports, so this is
+      the one thing about this board most worth confirming on real
+      hardware.
 
   BEFORE YOU FLASH:
   1. No Wi-Fi credentials to set here at all — flash as-is, then from the
@@ -91,7 +107,7 @@
 #include <DNSServer.h>
 #include <SPI.h>
 #include <GxEPD2_BW.h>
-#include <GxEPD2_420_GYE042A87.h>
+#include <gdey/GxEPD2_420_GDEY042T81.h>
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
@@ -132,8 +148,8 @@ const int DEFAULT_HAVDALAH_OFFSET_MIN = 42;  // "3 medium stars" — adjustable 
 #define BTN_ACTIVE_LOW 1   // flip to 0 if your unit reads the opposite way
 // ------------------------------------------------
 
-GxEPD2_BW<GxEPD2_420_GYE042A87, GxEPD2_420_GYE042A87::HEIGHT> display(
-  GxEPD2_420_GYE042A87(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
+GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(
+  GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
 Preferences prefs;
@@ -702,7 +718,7 @@ void countdownStrings(String &lineTop, String &lineBottom) {
 }
 
 void drawCountdownArea() {
-  printCentered("TIME REMAINING", 200, 41, 3, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("TIME REMAINING", 200, 42, 3, GxEPD_BLACK, GxEPD_WHITE);
 
   const int fx0 = 40, fy0 = 74, fx1 = 360, fy1 = 170;
   display.drawRoundRect(fx0, fy0, fx1 - fx0, fy1 - fy0, 8, GxEPD_BLACK);
