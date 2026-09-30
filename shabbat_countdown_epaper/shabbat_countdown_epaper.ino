@@ -533,13 +533,20 @@ void selectCity(int idx) {
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
   if (hasWallClock) {
-    // Always re-derive the timezone for this newly-picked location — it
-    // may be a different timezone than wherever the device's own Wi-Fi
-    // network is, so the earlier IP-based guess (or a previous ZIP/city's
-    // offset) must not be left in place.
-    if (!fetchTimezoneForCoords(latitude, longitude)) {
-      localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
-      saveUtcOffset();
+    // Always re-derive the timezone for this newly-picked location when
+    // we're actually online — it may be a different timezone than
+    // wherever the device's own Wi-Fi network is, so the earlier
+    // IP-based guess (or a previous ZIP/city's offset) must not be left
+    // in place. But if we're offline (the fully-offline SET TIME + CITY
+    // first-run path), the clock already holds the correct local time
+    // from setSystemTimeManually() (offset 0) — leave it alone, since
+    // there's no network to check a real timezone against anyway, and
+    // the longitude fallback would only corrupt an already-correct clock.
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!fetchTimezoneForCoords(latitude, longitude)) {
+        localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
+        saveUtcOffset();
+      }
     }
     computeShabbatTimes();
   }
@@ -793,13 +800,16 @@ void doGeocode() {
     saveCoords(latitude, longitude);
     needsGeocode = false;
     if (hasWallClock) {
-      // Always re-derive the timezone for this newly-picked location — it
-      // may be a different timezone than wherever the device's own Wi-Fi
-      // network is, so the earlier IP-based guess (or a previous ZIP/city's
-      // offset) must not be left in place.
-      if (!fetchTimezoneForCoords(latitude, longitude)) {
-        localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
-        saveUtcOffset();
+      // Only hit the network here when we're actually online — the
+      // fully-offline SET TIME + CITY path already has the correct local
+      // time from setSystemTimeManually() (offset 0); touching the offset
+      // with no network to check against would corrupt an already-correct
+      // clock, and picking a location offline only matters for solar math.
+      if (WiFi.status() == WL_CONNECTED) {
+        if (!fetchTimezoneForCoords(latitude, longitude)) {
+          localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
+          saveUtcOffset();
+        }
       }
       computeShabbatTimes();
     }
