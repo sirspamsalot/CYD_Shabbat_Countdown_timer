@@ -1356,6 +1356,39 @@ void setup() {
   Serial.println(F("[boot] EPD_PWR set HIGH, regulator should be up"));
 
   SPI.begin(EPD_SCLK, -1 /* MISO unused by the display */, EPD_MOSI, EPD_CS);
+
+  // ---- TEMPORARY DIAGNOSTIC: raw BUSY pin behavior ----
+  // Bypasses GxEPD2 entirely and pulses RST by hand, then watches the raw
+  // EPD_BUSY level for 2 seconds. This tells us what the panel's BUSY line
+  // is actually doing, independent of which GxEPD2 driver class is used —
+  // if it never changes at all, that points to wrong pin/wiring; if it
+  // toggles but settles "backwards" from what's expected (documented as
+  // HIGH=busy, LOW=ready for this panel), that confirms inverted polarity.
+  // Safe to delete this whole block once the real cause is found.
+  pinMode(EPD_RST, OUTPUT);
+  pinMode(EPD_BUSY, INPUT);
+  Serial.print(F("[diag] EPD_BUSY before reset: ")); Serial.println(digitalRead(EPD_BUSY));
+  digitalWrite(EPD_RST, LOW);
+  delay(20);
+  digitalWrite(EPD_RST, HIGH);
+  Serial.println(F("[diag] watching EPD_BUSY for 2s after a manual reset pulse (only level CHANGES are printed):"));
+  {
+    unsigned long diagStart = millis();
+    int lastLevel = -1;
+    while (millis() - diagStart < 2000) {
+      int level = digitalRead(EPD_BUSY);
+      if (level != lastLevel) {
+        Serial.print(F("[diag]   t="));
+        Serial.print(millis() - diagStart);
+        Serial.print(F("ms BUSY="));
+        Serial.println(level);
+        lastLevel = level;
+      }
+    }
+  }
+  Serial.println(F("[diag] done watching BUSY — if nothing printed above besides the first line, BUSY never changed at all"));
+  // ---- end diagnostic ----
+
   Serial.println(F("[boot] SPI.begin() done, calling display.init()..."));
   // reset_duration=50 (vs. the library default's shorter pulse): a
   // community-tested working setup for this exact panel uses a 50ms reset
