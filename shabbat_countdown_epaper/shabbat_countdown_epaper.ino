@@ -93,6 +93,7 @@
 #include <GxEPD2_420_GYE042A87.h>
 #include <Preferences.h>
 #include <time.h>
+#include <sys/time.h>
 #include <math.h>
 #include "cities.h" // 250 major world cities, for picking a location without a US ZIP code
 #include <Fonts/FreeSansBold9pt7b.h>
@@ -104,7 +105,7 @@
 // sketches: the Arduino build system inserts auto-generated function
 // prototypes right after the last #include, before these enum types would
 // otherwise be visible to functions that take them as parameters.
-enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_NUM_ENTRY, SCR_WIFI_SETUP, SCR_CITY_LIST };
+enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_NUM_ENTRY, SCR_WIFI_SETUP, SCR_CITY_LIST, SCR_FIRST_RUN };
 enum NumEntryPurpose { NUM_ZIP, NUM_HAVDALAH, NUM_YEAR, NUM_MONTH, NUM_DAY, NUM_HOUR, NUM_MINUTE };
 
 // ============ USER CONFIG ============
@@ -150,6 +151,14 @@ String currentPass = "";
 bool hasWifiCreds = false;
 bool usingCity = false;      // true if the location came from the CITY list rather than a ZIP
 String currentCityLabel = ""; // short "City" name shown in the header when usingCity is true
+bool setupDone = false;       // true once first-run setup (Wi-Fi OR offline SET TIME+CITY) has completed once
+
+// ---------------- First-run setup state (not persisted) ----------------
+// Set true only while the SCR_FIRST_RUN sequence is in progress, so the
+// SET TIME and Wi-Fi-portal flows know to route back into first-run (CITY
+// list / SCR_CLOCK) instead of to Settings once they finish.
+bool firstRunActive = false;
+int firstRunCursor = 0; // 0 = CONNECT TO WI-FI, 1 = SET TIME + CITY (OFFLINE)
 
 // ---------------- Runtime state ----------------
 time_t candleLightingEpoch = 0;
@@ -396,7 +405,36 @@ void loadSettings() {
   hasWifiCreds = currentSsid.length() > 0;
   usingCity = prefs.getBool("usingCity", false);
   currentCityLabel = prefs.getString("cityLbl", "");
+  setupDone = prefs.getBool("setupDone", false);
   prefs.end();
+}
+
+void markSetupDone() {
+  setupDone = true;
+  prefs.begin("shabbat", false);
+  prefs.putBool("setupDone", true);
+  prefs.end();
+}
+
+// Sets the system clock directly from user-entered LOCAL time, for the
+// fully offline SET TIME path — there's no NTP/Wi-Fi reference available to
+// derive a UTC offset from. localUtcOffsetSeconds is kept at 0 and the
+// system clock itself is made to hold local time instead, so downstream
+// code (formatLocalTime(), computeShabbatTimes()) — which only needs a
+// self-consistent epoch+offset pair — works correctly without ever having
+// had a real UTC reference.
+void setSystemTimeManually(int year, int month, int day, int hour, int minute) {
+  struct tm t = {};
+  t.tm_year = year - 1900;
+  t.tm_mon = month - 1;
+  t.tm_mday = day;
+  t.tm_hour = hour;
+  t.tm_min = minute;
+  t.tm_sec = 0;
+  t.tm_isdst = 0;
+  time_t epoch = mktime(&t);
+  struct timeval tv = { epoch, 0 };
+  settimeofday(&tv, nullptr);
 }
 
 void saveZip(const String &zip) {
@@ -441,6 +479,10 @@ void selectCity(int idx) {
       saveUtcOffset();
     }
     computeShabbatTimes();
+  }
+  if (firstRunActive) {
+    markSetupDone();
+    firstRunActive = false;
   }
   screenNeedsFullRedraw = true;
 }
@@ -594,12 +636,22 @@ void drawCountdownArea() {
   const int fx0 = 40, fy0 = 74, fx1 = 360, fy1 = 170;
   display.drawRoundRect(fx0, fy0, fx1 - fx0, fy1 - fy0, 8, GxEPD_BLACK);
 
-  if (!hasWifiCreds) {
-    printCentered("WI-FI NOT SET UP", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
-    printCentered("(MENU > WI-FI to configure)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
-  } else if (!hasWallClock) {
-    printCentered("WAITING FOR WI-FI", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
-    printCentered("(clock not set yet)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
+  // Unified gating: !hasWallClock covers both "never synced" (online path)
+  // AND "never manually set" (offline path) in one check, since either one
+  // leaves the clock unusable. The message branches on hasWifiCreds so an
+  // offline (manually-set clock, no Wi-Fi) device doesn't wrongly show a
+  // Wi-Fi nag once its clock has been set.
+  if (!hasWallClock) {
+    if (hasWifiCreds) {
+      printCentered("SYNCING TIME...", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
+      printCentered("(waiting on Wi-Fi/NTP)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
+    } else {
+      printCentered("SET UP WI-FI OR SET TIME", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
+      printCentered("(MENU > Settings)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
+    }
+  } else if (!hasCoords) {
+    printCentered("NO LOCATION SET", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
+    printCentered("(MENU > Settings)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
   } else if (needsGeocode) {
     printCentered("LOCATING...", 200, 112, 2, GxEPD_BLACK, GxEPD_WHITE);
   } else if (candleLightingEpoch == 0 || havdalahEpoch == 0) {
@@ -704,13 +756,30 @@ void settingsContent() {
   display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
   printCentered("SETTINGS", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
 
-  for (int i = 0; i < 6; i++) {
-    int y = 30 + i * 40;
+  // ZIP CODE and CITY render as two side-by-side half-width boxes in one
+  // row — a visual cue that they're alternatives, not two separate
+  // settings — which frees up more spacing for the rows below. UP/DOWN
+  // still cycles through all 6 options in order (settingsCursor 0-5); ZIP
+  // and CITY just share a row, with whichever one is current highlighted.
+  const int top = 30, rowH = 32, rowStep = 44;
+
+  bool selZip = (settingsCursor == 0);
+  if (selZip) display.fillRoundRect(20, top, 175, rowH, 6, GxEPD_BLACK);
+  else display.drawRoundRect(20, top, 175, rowH, 6, GxEPD_BLACK);
+  printCentered("ZIP CODE", 107, top + 7, 2, selZip ? GxEPD_WHITE : GxEPD_BLACK, selZip ? GxEPD_BLACK : GxEPD_WHITE);
+
+  bool selCity = (settingsCursor == 1);
+  if (selCity) display.fillRoundRect(205, top, 175, rowH, 6, GxEPD_BLACK);
+  else display.drawRoundRect(205, top, 175, rowH, 6, GxEPD_BLACK);
+  printCentered("CITY", 292, top + 7, 2, selCity ? GxEPD_WHITE : GxEPD_BLACK, selCity ? GxEPD_BLACK : GxEPD_WHITE);
+
+  for (int i = 2; i < 6; i++) {
+    int y = top + (i - 1) * rowStep;
     bool selected = (i == settingsCursor);
     uint16_t fg = selected ? GxEPD_WHITE : GxEPD_BLACK;
     uint16_t bg = selected ? GxEPD_BLACK : GxEPD_WHITE;
-    if (selected) display.fillRoundRect(30, y, 340, 32, 6, GxEPD_BLACK);
-    else display.drawRoundRect(30, y, 340, 32, 6, GxEPD_BLACK);
+    if (selected) display.fillRoundRect(30, y, 340, rowH, 6, GxEPD_BLACK);
+    else display.drawRoundRect(30, y, 340, rowH, 6, GxEPD_BLACK);
     printCentered(SETTINGS_LABELS[i], 200, y + 7, 2, fg, bg);
   }
   printCentered("UP/DOWN move   OK select   EXIT back", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
@@ -787,16 +856,43 @@ void startHavdalahEntry() {
   startNumEntry(NUM_HAVDALAH, "HAVDALAH OFFSET (MIN)", havdalahOffsetMin, 0, 180, 1);
 }
 
+// Used only as a starting point for the offline SET TIME stepper when the
+// clock has never been set (hasWallClock false) — parses the compile-time
+// __DATE__ macro ("Mon DD YYYY") instead of seeding from time(nullptr),
+// which would show the 1970 epoch, so the stepper starts somewhere roughly
+// current instead of at garbage.
+void compileBuildDate(int &y, int &mo, int &d) {
+  static const char* months[12] = { "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec" };
+  char monStr[4] = {0};
+  int day = 1, year = 2026;
+  y = 2026; mo = 1; d = 1;
+  if (sscanf(__DATE__, "%3s %d %d", monStr, &day, &year) == 3) {
+    for (int i = 0; i < 12; i++) {
+      if (strncmp(monStr, months[i], 3) == 0) { mo = i + 1; break; }
+    }
+    d = day;
+    y = year;
+  }
+}
+
 void startSetTimeEntry() {
-  // Seed from the device's current best-guess local time as a starting point.
-  time_t nowLocal = time(nullptr) + localUtcOffsetSeconds;
-  struct tm tmv;
-  gmtime_r(&nowLocal, &tmv); // treat as UTC struct since the offset's already folded in
-  tmpYear = tmv.tm_year + 1900;
-  tmpMonth = tmv.tm_mon + 1;
-  tmpDay = tmv.tm_mday;
-  tmpHour = tmv.tm_hour;
-  tmpMinute = tmv.tm_min;
+  if (hasWallClock) {
+    // Seed from the device's current best-guess local time as a starting point.
+    time_t nowLocal = time(nullptr) + localUtcOffsetSeconds;
+    struct tm tmv;
+    gmtime_r(&nowLocal, &tmv); // treat as UTC struct since the offset's already folded in
+    tmpYear = tmv.tm_year + 1900;
+    tmpMonth = tmv.tm_mon + 1;
+    tmpDay = tmv.tm_mday;
+    tmpHour = tmv.tm_hour;
+    tmpMinute = tmv.tm_min;
+  } else {
+    // No wall clock yet (offline first-run path) — time(nullptr) is still
+    // the 1970 epoch, so seed from the firmware's own build date instead.
+    compileBuildDate(tmpYear, tmpMonth, tmpDay);
+    tmpHour = 18;
+    tmpMinute = 0;
+  }
   startNumEntry(NUM_YEAR, "ENTER YEAR", tmpYear, 2024, 2100, 1);
 }
 
@@ -832,12 +928,29 @@ void handleNumEntryButtons() {
         break;
       case NUM_MINUTE: {
         tmpMinute = numValue;
-        time_t enteredLocalEpoch = utcToEpoch(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute, 0);
-        time_t nowUtc = time(nullptr);
-        localUtcOffsetSeconds = (long)(enteredLocalEpoch - nowUtc);
-        saveUtcOffset();
+        if (hasWifiCreds) {
+          // Online path: derive the local UTC offset by comparing the
+          // entered local time against the NTP-verified system clock.
+          time_t enteredLocalEpoch = utcToEpoch(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute, 0);
+          time_t nowUtc = time(nullptr);
+          localUtcOffsetSeconds = (long)(enteredLocalEpoch - nowUtc);
+          saveUtcOffset();
+        } else {
+          // Offline path: no NTP reference exists at all, so set the
+          // system clock directly to the entered LOCAL time and keep the
+          // offset at 0 — a self-consistent epoch+offset pair is all
+          // formatLocalTime()/computeShabbatTimes() need.
+          setSystemTimeManually(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute);
+          localUtcOffsetSeconds = 0;
+          saveUtcOffset();
+          hasWallClock = true;
+        }
         if (hasCoords) computeShabbatTimes();
-        screen = SCR_SETTINGS; drawSettingsScreen();
+        if (firstRunActive) {
+          cityListTop = 0; cityListCursor = 0; screen = SCR_CITY_LIST; drawCityListScreen();
+        } else {
+          screen = SCR_SETTINGS; drawSettingsScreen();
+        }
         break;
       }
       default: break;
@@ -950,8 +1063,18 @@ void handlePortalSave() {
     "</body></html>");
   stopWifiSetupPortal();
   saveWifiCreds(ssid, pass); // switches back to STA mode internally and tries NTP right away
-  screen = SCR_SETTINGS;
-  drawSettingsScreen();
+  if (firstRunActive) {
+    // Wi-Fi path considers first-run setup complete once creds are saved —
+    // NTP sync and geocoding continue in the background as normal from
+    // here (see saveWifiCreds()/loop()).
+    markSetupDone();
+    firstRunActive = false;
+    screen = SCR_CLOCK;
+    screenNeedsFullRedraw = true;
+  } else {
+    screen = SCR_SETTINGS;
+    drawSettingsScreen();
+  }
 }
 
 void startWifiSetupPortal() {
@@ -985,6 +1108,49 @@ void handleWifiSetupLoop() {
 }
 
 // =========================================================================
+// Screen: first-run setup choice — shown once, before setupDone is true.
+// Offers the existing Wi-Fi flow (auto time + auto location) or a fully
+// offline path (manual SET TIME + pick-a-city, no network ever required).
+// UP/DOWN toggles which of the two options is highlighted, OK selects it.
+// =========================================================================
+void firstRunContent() {
+  display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
+  printCentered("WELCOME - SET UP CLOCK", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
+
+  bool sel0 = (firstRunCursor == 0);
+  if (sel0) display.fillRoundRect(40, 50, 320, 90, 10, GxEPD_BLACK);
+  else display.drawRoundRect(40, 50, 320, 90, 10, GxEPD_BLACK);
+  printCentered("CONNECT TO WI-FI", 200, 75, 2, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
+  printCentered("auto time + auto location", 200, 108, 1, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
+
+  bool sel1 = (firstRunCursor == 1);
+  if (sel1) display.fillRoundRect(40, 160, 320, 90, 10, GxEPD_BLACK);
+  else display.drawRoundRect(40, 160, 320, 90, 10, GxEPD_BLACK);
+  printCentered("SET TIME + CITY", 200, 185, 2, sel1 ? GxEPD_WHITE : GxEPD_BLACK, sel1 ? GxEPD_BLACK : GxEPD_WHITE);
+  printCentered("offline, no network needed", 200, 218, 1, sel1 ? GxEPD_WHITE : GxEPD_BLACK, sel1 ? GxEPD_BLACK : GxEPD_WHITE);
+
+  printCentered("UP/DOWN choose   OK select", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
+}
+
+void drawFirstRunScreen() { fullRefreshGeneric(firstRunContent); }
+
+void handleFirstRunButtons() {
+  if (upPressed() || downPressed()) {
+    firstRunCursor = 1 - firstRunCursor;
+    drawFirstRunScreen();
+  }
+  if (okPressed()) {
+    firstRunActive = true;
+    if (firstRunCursor == 0) {
+      screen = SCR_WIFI_SETUP;
+      startWifiSetupPortal();
+    } else {
+      startSetTimeEntry();
+    }
+  }
+}
+
+// =========================================================================
 // Setup / Loop
 // =========================================================================
 void setup() {
@@ -1002,6 +1168,16 @@ void setup() {
   display.setRotation(1); // landscape; try 0/2/3 if the image is sideways/mirrored on your unit
 
   loadSettings();
+
+  if (!setupDone) {
+    // First boot: show the Wi-Fi vs. offline choice instead of jumping
+    // straight into the normal auto-NTP/auto-geocode boot sequence —
+    // neither is meaningful until the user has picked a path.
+    firstRunActive = true;
+    screen = SCR_FIRST_RUN;
+    drawFirstRunScreen();
+    return;
+  }
 
   if (hasWifiCreds) {
     fullRefreshGeneric(connectingContent);
@@ -1081,6 +1257,7 @@ void loop() {
     case SCR_NUM_ENTRY: handleNumEntryButtons();  break;
     case SCR_WIFI_SETUP: handleWifiSetupLoop();   break;
     case SCR_CITY_LIST:  handleCityListButtons(); break;
+    case SCR_FIRST_RUN:  handleFirstRunButtons(); break;
   }
 
   delay(20); // light debounce between reads
