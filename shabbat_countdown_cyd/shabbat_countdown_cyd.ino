@@ -16,8 +16,9 @@
     LCD driver:   ILI9341, SPI
                   CS=15  DC=2  SCLK=14  MOSI=13  MISO=12  BL=21 (PWM-dimmable)
                   Reset is tied to EN, no separate GPIO — pass -1.
-    Touch driver: XPT2046, resistive, SPI (shares the display's SCLK/MOSI/MISO)
-                  CS=33  IRQ=36
+    Touch driver: XPT2046, resistive, SPI — on its OWN separate SPI bus,
+                  NOT sharing the display's SCLK/MOSI/MISO (a common CYD gotcha)
+                  CLK=25  MOSI=32  MISO=39  CS=33  IRQ=36
     USB:          CH340 or CP2102 USB-UART bridge — plain Serial works
                   normally here; this board doesn't have the ESP32-S3
                   native-USB quirk the other version had to work around.
@@ -124,8 +125,14 @@ const int DEFAULT_BRIGHTNESS_PCT = 100;
 #define LCD_MISO 12
 #define LCD_BL   21
 
-#define TOUCH_CS  33
-#define TOUCH_IRQ 36
+// The touch controller is on its OWN separate SPI bus on this board — it
+// does NOT share the display's SCLK/MOSI/MISO pins, despite both being SPI
+// devices. This is a well-known gotcha specific to the CYD family.
+#define TOUCH_CLK  25
+#define TOUCH_MOSI 32
+#define TOUCH_MISO 39
+#define TOUCH_CS   33
+#define TOUCH_IRQ  36
 
 #define BL_PWM_CHANNEL 0
 #define BL_PWM_FREQ    5000
@@ -153,6 +160,7 @@ const int DEFAULT_BRIGHTNESS_PCT = 100;
 
 SPIClass tftSPI(HSPI);
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&tftSPI, LCD_DC, LCD_CS, LCD_RST);
+SPIClass touchSPI(VSPI); // touch's own bus — see the pin note above
 XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 Preferences prefs;
 
@@ -200,7 +208,7 @@ String textBuffer = "";
 int textMaxLen = 32;
 String pendingSsid = ""; // holds the SSID between the SSID and password steps
 
-// ---------------- Touch driver: XPT2046 (resistive, shares display SPI bus) ----------------
+// ---------------- Touch driver: XPT2046 (resistive, own separate SPI bus) ----------------
 // Raw ADC range the touch controller reports at each axis extreme, mapped
 // onto our 320x240 landscape screen. These are typical starting values for
 // this board family, but resistive panels vary unit to unit and by
@@ -220,7 +228,8 @@ String pendingSsid = ""; // holds the SSID between the SSID and password steps
 #define TOUCH_DEBUG 0
 
 bool touchInit() {
-  ts.begin(tftSPI); // shares the display's SPI bus; touch has its own CS/IRQ pins
+  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  ts.begin(touchSPI);
   return true;
 }
 
