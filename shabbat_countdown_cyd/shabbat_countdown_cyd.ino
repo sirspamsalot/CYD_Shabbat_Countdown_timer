@@ -981,7 +981,7 @@ void drawCountdownFrame() {
     return;
   }
 
-  printCentered("TIME REMAINING", 160, 40, 3, COLOR_ACCENT, COLOR_BG);
+  printCentered("TIME REMAINING", 160, 38, 3, COLOR_ACCENT, COLOR_BG);
 
   int fx0 = digitX[0] - 14, fy0 = CLOCK_Y - 12;
   int fx1 = digitX[6] + DIGIT_W + 14, fy1 = CLOCK_Y + DIGIT_H + 22;
