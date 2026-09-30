@@ -105,7 +105,7 @@
 // sketches: the Arduino build system inserts auto-generated function
 // prototypes right after the last #include, before these enum types would
 // otherwise be visible to functions that take them as parameters.
-enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_NUM_ENTRY, SCR_WIFI_SETUP, SCR_CITY_LIST, SCR_FIRST_RUN };
+enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_NUM_ENTRY, SCR_WIFI_SETUP, SCR_CITY_LIST, SCR_FIRST_RUN, SCR_CONFIRM_RESET };
 enum NumEntryPurpose { NUM_ZIP, NUM_HAVDALAH, NUM_YEAR, NUM_MONTH, NUM_DAY, NUM_HOUR, NUM_MINUTE };
 
 // ============ USER CONFIG ============
@@ -178,7 +178,8 @@ const unsigned long FULL_REFRESH_INTERVAL_MS = 30UL * 60UL * 1000UL; // ghost-cl
 
 AppScreen screen = SCR_CLOCK;
 int settingsCursor = 0;
-const char* SETTINGS_LABELS[6] = { "ZIP CODE", "CITY", "WI-FI", "SET TIME", "HAVDALAH OFFSET", "BACK" };
+const char* SETTINGS_LABELS[7] = { "ZIP CODE", "CITY", "WI-FI", "SET TIME", "HAVDALAH OFFSET", "SYSTEM RESET", "BACK" };
+int confirmResetCursor = 1; // 0 = YES, 1 = CANCEL (default); confirm screen for Settings > SYSTEM RESET
 
 int cityListTop = 0;    // index of the first visible row in the CITY list screen
 int cityListCursor = 0; // highlighted row within the visible window (0..CITY_ROWS_VISIBLE-1)
@@ -376,6 +377,36 @@ bool geocodeZip(const String &zip) {
   return true;
 }
 
+// ---------------- IP-based timezone lookup (Wi-Fi only, no lat/lon needed) ----------------
+// Once Wi-Fi is connected we already have a public IP, and that alone is
+// enough to look up the real timezone (DST included) — no ZIP/city/lat/lon
+// needed at all. This is why it's called right after every successful NTP
+// sync, even before a location has been picked. It replaces relying on the
+// crude longitude/15 estimate below for anyone who ever connects to Wi-Fi:
+// that estimate ignores DST and real timezone/political boundaries, which
+// rarely line up with 15-degree longitude bands. If this lookup fails
+// (network hiccup, DNS issue, unexpected response), hasUtcOffset is simply
+// left false and the longitude fallback still kicks in as before.
+bool fetchTimezoneFromIP() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin("http://worldtimeapi.org/api/ip");
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, payload)) return false;
+  if (!doc.containsKey("raw_offset") || !doc.containsKey("dst_offset")) return false;
+
+  long rawOffset = doc["raw_offset"].as<long>();
+  long dstOffset = doc["dst_offset"].as<long>();
+  localUtcOffsetSeconds = rawOffset + dstOffset;
+  saveUtcOffset();
+  return true;
+}
+
 // ---------------- Local-time display formatting ----------------
 String formatLocalTime(time_t utcEpoch) {
   time_t localEpoch = utcEpoch + localUtcOffsetSeconds;
@@ -521,6 +552,7 @@ void saveWifiCreds(const String &ssid, const String &pass) {
   hasWallClock = attemptNtpSync(15000, 8000);
   lastNtpAttemptMs = millis();
   if (hasWallClock) {
+    fetchTimezoneFromIP();
     if (!hasCoords) needsGeocode = true;
     else if (!hasUtcOffset) {
       localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600;
@@ -759,28 +791,30 @@ void settingsContent() {
   // ZIP CODE and CITY render as two side-by-side half-width boxes in one
   // row — a visual cue that they're alternatives, not two separate
   // settings — which frees up more spacing for the rows below. UP/DOWN
-  // still cycles through all 6 options in order (settingsCursor 0-5); ZIP
+  // still cycles through all 7 options in order (settingsCursor 0-6); ZIP
   // and CITY just share a row, with whichever one is current highlighted.
-  const int top = 30, rowH = 32, rowStep = 44;
+  // rowH/rowStep are trimmed slightly from their original 32/44 so the new
+  // SYSTEM RESET row still fits above the footer hint at y=286.
+  const int top = 30, rowH = 30, rowStep = 40;
 
   bool selZip = (settingsCursor == 0);
   if (selZip) display.fillRoundRect(20, top, 175, rowH, 6, GxEPD_BLACK);
   else display.drawRoundRect(20, top, 175, rowH, 6, GxEPD_BLACK);
-  printCentered("ZIP CODE", 107, top + 7, 2, selZip ? GxEPD_WHITE : GxEPD_BLACK, selZip ? GxEPD_BLACK : GxEPD_WHITE);
+  printCentered("ZIP CODE", 107, top + 6, 2, selZip ? GxEPD_WHITE : GxEPD_BLACK, selZip ? GxEPD_BLACK : GxEPD_WHITE);
 
   bool selCity = (settingsCursor == 1);
   if (selCity) display.fillRoundRect(205, top, 175, rowH, 6, GxEPD_BLACK);
   else display.drawRoundRect(205, top, 175, rowH, 6, GxEPD_BLACK);
-  printCentered("CITY", 292, top + 7, 2, selCity ? GxEPD_WHITE : GxEPD_BLACK, selCity ? GxEPD_BLACK : GxEPD_WHITE);
+  printCentered("CITY", 292, top + 6, 2, selCity ? GxEPD_WHITE : GxEPD_BLACK, selCity ? GxEPD_BLACK : GxEPD_WHITE);
 
-  for (int i = 2; i < 6; i++) {
+  for (int i = 2; i < 7; i++) {
     int y = top + (i - 1) * rowStep;
     bool selected = (i == settingsCursor);
     uint16_t fg = selected ? GxEPD_WHITE : GxEPD_BLACK;
     uint16_t bg = selected ? GxEPD_BLACK : GxEPD_WHITE;
     if (selected) display.fillRoundRect(30, y, 340, rowH, 6, GxEPD_BLACK);
     else display.drawRoundRect(30, y, 340, rowH, 6, GxEPD_BLACK);
-    printCentered(SETTINGS_LABELS[i], 200, y + 7, 2, fg, bg);
+    printCentered(SETTINGS_LABELS[i], 200, y + 6, 2, fg, bg);
   }
   printCentered("UP/DOWN move   OK select   EXIT back", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
 }
@@ -959,8 +993,8 @@ void handleNumEntryButtons() {
 }
 
 void handleSettingsButtons() {
-  if (upPressed())   { settingsCursor = (settingsCursor + 5) % 6; drawSettingsScreen(); }
-  if (downPressed()) { settingsCursor = (settingsCursor + 1) % 6; drawSettingsScreen(); }
+  if (upPressed())   { settingsCursor = (settingsCursor + 6) % 7; drawSettingsScreen(); }
+  if (downPressed()) { settingsCursor = (settingsCursor + 1) % 7; drawSettingsScreen(); }
   if (exitPressed()) { screen = SCR_CLOCK; screenNeedsFullRedraw = true; }
   if (okPressed()) {
     switch (settingsCursor) {
@@ -969,7 +1003,88 @@ void handleSettingsButtons() {
       case 2: screen = SCR_WIFI_SETUP; startWifiSetupPortal(); break;
       case 3: startSetTimeEntry(); break;
       case 4: startHavdalahEntry(); break;
-      case 5: screen = SCR_CLOCK; screenNeedsFullRedraw = true; break;
+      case 5: confirmResetCursor = 1; screen = SCR_CONFIRM_RESET; drawConfirmResetScreen(); break;
+      case 6: screen = SCR_CLOCK; screenNeedsFullRedraw = true; break;
+    }
+  }
+}
+
+// =========================================================================
+// Screen: SYSTEM RESET confirmation — reachable from Settings. Wipes every
+// persisted key (Wi-Fi creds, location, time offset, havdalah offset, etc.)
+// and drops the device back into the SCR_FIRST_RUN flow, same as a fresh
+// unconfigured boot. UP/DOWN moves the highlight between YES/CANCEL, OK
+// confirms the highlighted choice, EXIT cancels outright.
+// =========================================================================
+void confirmResetContent() {
+  display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
+  printCentered("SYSTEM RESET", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
+
+  printCentered("ARE YOU SURE?", 200, 50, 2, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("erases wifi, location, time", 200, 90, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("and all settings", 200, 108, 1, GxEPD_BLACK, GxEPD_WHITE);
+
+  bool selYes = (confirmResetCursor == 0);
+  if (selYes) display.fillRoundRect(60, 160, 140, 60, 8, GxEPD_BLACK);
+  else display.drawRoundRect(60, 160, 140, 60, 8, GxEPD_BLACK);
+  printCentered("YES, RESET", 130, 182, 1, selYes ? GxEPD_WHITE : GxEPD_BLACK, selYes ? GxEPD_BLACK : GxEPD_WHITE);
+
+  bool selNo = (confirmResetCursor == 1);
+  if (selNo) display.fillRoundRect(220, 160, 140, 60, 8, GxEPD_BLACK);
+  else display.drawRoundRect(220, 160, 140, 60, 8, GxEPD_BLACK);
+  printCentered("CANCEL", 290, 182, 1, selNo ? GxEPD_WHITE : GxEPD_BLACK, selNo ? GxEPD_BLACK : GxEPD_WHITE);
+
+  printCentered("UP/DOWN choose   OK confirm   EXIT cancel", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
+}
+
+void drawConfirmResetScreen() { fullRefreshGeneric(confirmResetContent); }
+
+// Wipes the entire "shabbat" Preferences namespace, resets in-RAM state to
+// just-booted defaults (mirroring what loadSettings() would load from an
+// empty namespace), and re-enters SCR_FIRST_RUN — the same state a brand
+// new, never-configured device would be in.
+void performSystemReset() {
+  prefs.begin("shabbat", false);
+  prefs.clear();
+  prefs.end();
+
+  currentZip = DEFAULT_ZIP;
+  latitude = 0.0;
+  longitude = 0.0;
+  hasCoords = false;
+  havdalahOffsetMin = DEFAULT_HAVDALAH_OFFSET_MIN;
+  localUtcOffsetSeconds = 0;
+  hasUtcOffset = false;
+  currentSsid = "";
+  currentPass = "";
+  hasWifiCreds = false;
+  usingCity = false;
+  currentCityLabel = "";
+  setupDone = false;
+  candleLightingEpoch = 0;
+  havdalahEpoch = 0;
+  hasWallClock = false;
+  needsGeocode = false;
+  screenNeedsFullRedraw = true;
+
+  firstRunActive = true;
+  screen = SCR_FIRST_RUN;
+  drawFirstRunScreen();
+}
+
+void handleConfirmResetButtons() {
+  if (upPressed() || downPressed()) {
+    confirmResetCursor = 1 - confirmResetCursor;
+    drawConfirmResetScreen();
+  }
+  if (exitPressed()) {
+    screen = SCR_SETTINGS; drawSettingsScreen();
+  }
+  if (okPressed()) {
+    if (confirmResetCursor == 0) {
+      performSystemReset();
+    } else {
+      screen = SCR_SETTINGS; drawSettingsScreen();
     }
   }
 }
@@ -1109,8 +1224,9 @@ void handleWifiSetupLoop() {
 
 // =========================================================================
 // Screen: first-run setup choice — shown once, before setupDone is true.
-// Offers the existing Wi-Fi flow (auto time + auto location) or a fully
-// offline path (manual SET TIME + pick-a-city, no network ever required).
+// Offers the existing Wi-Fi flow (auto time via NTP; location is set
+// separately in Settings, or defaults to Las Vegas) or a fully offline
+// path (manual SET TIME + pick-a-city, no network ever required).
 // UP/DOWN toggles which of the two options is highlighted, OK selects it.
 // =========================================================================
 void firstRunContent() {
@@ -1121,7 +1237,7 @@ void firstRunContent() {
   if (sel0) display.fillRoundRect(40, 50, 320, 90, 10, GxEPD_BLACK);
   else display.drawRoundRect(40, 50, 320, 90, 10, GxEPD_BLACK);
   printCentered("CONNECT TO WI-FI", 200, 75, 2, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
-  printCentered("auto time + auto location", 200, 108, 1, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
+  printCentered("auto time, set location after", 200, 108, 1, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
 
   bool sel1 = (firstRunCursor == 1);
   if (sel1) display.fillRoundRect(40, 160, 320, 90, 10, GxEPD_BLACK);
@@ -1188,6 +1304,7 @@ void setup() {
   lastNtpAttemptMs = millis();
 
   if (hasWallClock) {
+    fetchTimezoneFromIP();
     if (!hasCoords) {
       needsGeocode = true;
     } else if (!hasUtcOffset) {
@@ -1219,6 +1336,7 @@ void loop() {
         bool hadWallClock = hasWallClock;
         if (attemptNtpSync(6000, 5000)) {
           hasWallClock = true;
+          fetchTimezoneFromIP();
           if (!hadWallClock) {
             if (!hasCoords) needsGeocode = true;
             else if (!hasUtcOffset) {
@@ -1258,6 +1376,7 @@ void loop() {
     case SCR_WIFI_SETUP: handleWifiSetupLoop();   break;
     case SCR_CITY_LIST:  handleCityListButtons(); break;
     case SCR_FIRST_RUN:  handleFirstRunButtons(); break;
+    case SCR_CONFIRM_RESET: handleConfirmResetButtons(); break;
   }
 
   delay(20); // light debounce between reads
