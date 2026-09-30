@@ -1,9 +1,14 @@
-name: Build CYD Firmware
+name: Build Firmware
 
-# Compiles shabbat_countdown_cyd/shabbat_countdown_cyd.ino with arduino-cli
-# and drops the flash-ready binaries into web-flasher/firmware/, so the
-# GitHub Pages-hosted web flasher always serves whatever's on main. No
-# desktop Arduino IDE or manual "Export Compiled Binary" step required —
+# Compiles both hardware targets with arduino-cli:
+#   - shabbat_countdown_cyd (CYD, plain ESP32) — binaries land in
+#     web-flasher/firmware/ so the GitHub Pages-hosted browser flasher
+#     always serves whatever's on main.
+#   - shabbat_countdown_epaper (CrowPanel ESP32-S3 4.2" e-paper) — binaries
+#     land in BOTH epaper-firmware/ (for manual esptool flashing) and
+#     web-flasher/firmware-epaper/ (so the same browser flasher page can
+#     offer it too, via web-flasher/epaper-manifest.json).
+# No desktop Arduino IDE or manual "Export Compiled Binary" step required —
 # push a sketch change and this does it.
 
 on:
@@ -11,6 +16,7 @@ on:
     branches: [ main ]
     paths:
       - 'shabbat_countdown_cyd/shabbat_countdown_cyd.ino'
+      - 'shabbat_countdown_epaper/shabbat_countdown_epaper.ino'
       - '.github/workflows/build-firmware.yml'
   workflow_dispatch: {}
 
@@ -51,15 +57,29 @@ jobs:
             "Adafruit GFX Library" \
             "Adafruit ILI9341" \
             "XPT2046_Touchscreen" \
+            "GxEPD2" \
             "ArduinoJson"
 
-      - name: Compile (ESP32 Dev Module, i.e. the plain ESP32 the CYD uses)
+      - name: Compile CYD sketch (ESP32 Dev Module, i.e. the plain ESP32 the CYD uses)
         run: |
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
             --export-binaries \
             -v \
             shabbat_countdown_cyd
+
+      - name: Compile e-paper sketch (ESP32S3 Dev Module, PSRAM enabled)
+        # PSRAM=opi assumes the "octal" PSRAM variant (matches the
+        # ESP32-S3-WROOM-1-N8R8 module this board uses); if the ESP32
+        # Arduino core's menu option name has drifted by the time you read
+        # this, `arduino-cli board details -b esp32:esp32:esp32s3` lists
+        # the current valid values.
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=8M \
+            --export-binaries \
+            -v \
+            shabbat_countdown_epaper
 
       - name: Collect firmware binaries for the web flasher
         run: |
@@ -73,10 +93,22 @@ jobs:
           BOOT_APP0=$(find ~/.arduino15/packages/esp32 -name boot_app0.bin | head -n1)
           cp "$BOOT_APP0" web-flasher/firmware/boot_app0.bin
 
+      - name: Collect e-paper firmware binaries
+        run: |
+          mkdir -p epaper-firmware web-flasher/firmware-epaper
+          BUILD_DIR=shabbat_countdown_epaper/build/esp32.esp32.esp32s3
+          BOOT_APP0=$(find ~/.arduino15/packages/esp32 -name boot_app0.bin | head -n1)
+          for DEST in epaper-firmware web-flasher/firmware-epaper; do
+            cp "$BUILD_DIR/shabbat_countdown_epaper.ino.bin"          "$DEST/firmware.bin"
+            cp "$BUILD_DIR/shabbat_countdown_epaper.ino.bootloader.bin" "$DEST/bootloader.bin"
+            cp "$BUILD_DIR/shabbat_countdown_epaper.ino.partitions.bin" "$DEST/partitions.bin"
+            cp "$BOOT_APP0" "$DEST/boot_app0.bin"
+          done
+
       - name: Commit updated firmware binaries
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add web-flasher/firmware
-          git diff --cached --quiet || git commit -m "Auto-build: update CYD firmware binaries [skip ci]"
+          git add web-flasher/firmware web-flasher/firmware-epaper epaper-firmware
+          git diff --cached --quiet || git commit -m "Auto-build: update firmware binaries [skip ci]"
           git push
