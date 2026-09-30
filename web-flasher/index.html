@@ -96,12 +96,29 @@
       margin-top: 32px;
     }
     a { color: var(--panel-edge); }
+    .screenshot {
+      display: block;
+      width: 100%;
+      max-width: 480px;
+      margin: 0 auto 8px;
+      border-radius: 10px;
+      border: 1px solid var(--panel-edge);
+    }
+    .screenshot-caption {
+      text-align: center;
+      font-size: 0.8rem;
+      opacity: 0.65;
+      margin: 0 0 28px;
+    }
   </style>
 </head>
 <body>
   <main>
     <h1>Shabbat Countdown — CYD Flasher</h1>
     <p class="sub">Flash the ShabbatCon countdown clock firmware straight from your browser — no software to install.</p>
+
+    <img class="screenshot" src="screenshot.png" alt="Mid-week screenshot of the countdown clock UI, showing days/hours/minutes/seconds until candle-lighting">
+    <p class="screenshot-caption">What the display looks like mid-week, counting down to candle-lighting</p>
 
     <div class="card">
       <h2>Before you flash</h2>
