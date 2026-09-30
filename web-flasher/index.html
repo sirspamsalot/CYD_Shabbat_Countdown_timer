@@ -157,6 +157,7 @@
 
     <div class="board-picker">
       <button type="button" class="board-btn active" data-board="cyd">CYD<br><span style="font-weight:400; opacity:0.8;">touchscreen</span></button>
+      <button type="button" class="board-btn" data-board="esp32-32e">ESP32-32E<br><span style="font-weight:400; opacity:0.8;">4.0" touchscreen</span></button>
       <button type="button" class="board-btn" data-board="epaper">CrowPanel<br><span style="font-weight:400; opacity:0.8;">e-paper</span></button>
     </div>
 
@@ -174,6 +175,57 @@
       <div class="card">
         <h2>Install firmware</h2>
         <esp-web-install-button manifest="./manifest.json">
+          <button slot="activate">Connect &amp; Flash</button>
+          <span slot="unsupported" class="unsupported" style="display:block;">
+            Your browser doesn't support Web Serial. Please open this page in
+            <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer instead.
+          </span>
+          <span slot="not-allowed" class="unsupported" style="display:block;">
+            This page needs to be served over <strong>HTTPS</strong> (GitHub Pages is) —
+            Web Serial is blocked on plain HTTP.
+          </span>
+        </esp-web-install-button>
+      </div>
+
+      <div class="card">
+        <h2>After flashing</h2>
+        <p>
+          The device boots straight into a first-run screen offering two choices:
+          <strong>connect to Wi-Fi</strong> (auto time sync, then set a ZIP or city) or
+          <strong>set time + city for fully offline use</strong> (no network ever
+          required). Wi-Fi credentials, ZIP/city, brightness, havdalah offset, and the
+          clock are all saved to the device's own storage, never baked into the
+          firmware — so this same public build works for anyone.
+        </p>
+        <p>
+          Settings → SYSTEM RESET wipes everything and returns to that first-run
+          screen, if you ever want to start over.
+        </p>
+      </div>
+    </section>
+
+    <!-- ===================== ESP32-32E ===================== -->
+    <section data-board-panel="esp32-32e">
+      <div class="card">
+        <h2>Before you flash</h2>
+        <ol>
+          <li>Use <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer (Web Serial isn't available in Safari, Firefox, or on most mobile browsers).</li>
+          <li>Connect your LCDWiki "4.0inch ESP32-32E Display" board with a USB cable that carries data — some cables are charge-only.</li>
+          <li>Click the button below, pick the board's serial port when prompted, and follow the on-screen steps.</li>
+        </ol>
+        <div class="caveat">
+          <strong>Newest board in this project — not yet confirmed on real hardware.</strong>
+          The display driver, pins, and shared display/touch SPI bus wiring are taken
+          directly from the board's own published pinout, but this exact firmware
+          hasn't been flashed onto a real unit yet. If it boots but the screen stays
+          blank or taps land off-target, see the README's ESP32-32E section — touch
+          calibration in particular will likely need adjusting per-unit.
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Install firmware</h2>
+        <esp-web-install-button manifest="./esp32-32e-manifest.json">
           <button slot="activate">Connect &amp; Flash</button>
           <span slot="unsupported" class="unsupported" style="display:block;">
             Your browser doesn't support Web Serial. Please open this page in

@@ -1,0 +1,16 @@
+{
+  "name": "Shabbat Countdown (ESP32-32E 4.0\" Display)",
+  "version": "1.0.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "firmware-esp32-32e/bootloader.bin", "offset": 4096 },
+        { "path": "firmware-esp32-32e/partitions.bin", "offset": 32768 },
+        { "path": "firmware-esp32-32e/boot_app0.bin", "offset": 57344 },
+        { "path": "firmware-esp32-32e/firmware.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}
