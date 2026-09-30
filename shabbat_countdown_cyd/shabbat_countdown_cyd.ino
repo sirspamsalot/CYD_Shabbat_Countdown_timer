@@ -76,6 +76,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
 #include <time.h>
+#include <sys/time.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -92,7 +93,7 @@
 // immediately after the last #include — before any type defined later in
 // this file would otherwise be visible. Several functions take these enums
 // as parameters, so they have to exist before that insertion point.
-enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_KEYPAD, SCR_BRIGHTNESS, SCR_TEXTPAD, SCR_CITY_LIST };
+enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_KEYPAD, SCR_BRIGHTNESS, SCR_TEXTPAD, SCR_CITY_LIST, SCR_FIRST_RUN };
 enum KeypadPurpose { KP_ZIP, KP_HAVDALAH, KP_YEAR, KP_MONTH, KP_DAY, KP_HOUR, KP_MINUTE };
 // Alphanumeric text entry (Wi-Fi SSID/password) is a separate keyboard
 // screen from the numeric keypad above, since it needs letters and symbols.
@@ -180,6 +181,13 @@ bool hasWifiCreds = false; // false until a real SSID has been saved (see Settin
 bool usingCity = false;      // true if the location came from the CITY list rather than a ZIP
 String currentCityLabel = ""; // short "City" name shown in the header when usingCity is true
 int cityListTop = 0;          // index of the first visible row in the CITY list screen
+bool setupDone = false;       // true once first-run setup (Wi-Fi OR offline SET TIME+CITY) has completed once
+
+// ---------------- First-run setup state (not persisted) ----------------
+// Set true only while the SCR_FIRST_RUN sequence is in progress, so the
+// SET TIME and Wi-Fi-password flows know to route back into first-run
+// (CITY list / SCR_CLOCK) instead of to Settings once they finish.
+bool firstRunActive = false;
 
 // ---------------- Runtime state ----------------
 time_t candleLightingEpoch = 0;
@@ -511,6 +519,14 @@ void loadSettings() {
   hasWifiCreds = currentSsid.length() > 0 && currentSsid != "YOUR_WIFI_SSID";
   usingCity = prefs.getBool("usingCity", false);
   currentCityLabel = prefs.getString("cityLbl", "");
+  setupDone = prefs.getBool("setupDone", false);
+  prefs.end();
+}
+
+void markSetupDone() {
+  setupDone = true;
+  prefs.begin("shabbat", false);
+  prefs.putBool("setupDone", true);
   prefs.end();
 }
 
@@ -566,6 +582,10 @@ void selectCity(int idx) {
     }
     computeShabbatTimes();
   }
+  if (firstRunActive) {
+    markSetupDone();
+    firstRunActive = false;
+  }
   screenNeedsFullRedraw = true;
 }
 
@@ -587,6 +607,27 @@ void saveUtcOffset() {
   prefs.putBool("hasUtcOff", true);
   prefs.end();
   hasUtcOffset = true;
+}
+
+// Sets the system clock directly from user-entered LOCAL time, for the
+// fully offline SET TIME path — there's no NTP/Wi-Fi reference available to
+// derive a UTC offset from. localUtcOffsetSeconds is kept at 0 and the
+// system clock itself is made to hold local time instead, so downstream
+// code (formatLocalTime(), computeShabbatTimes()) — which only needs a
+// self-consistent epoch+offset pair — works correctly without ever having
+// had a real UTC reference.
+void setSystemTimeManually(int year, int month, int day, int hour, int minute) {
+  struct tm t = {};
+  t.tm_year = year - 1900;
+  t.tm_mon = month - 1;
+  t.tm_mday = day;
+  t.tm_hour = hour;
+  t.tm_min = minute;
+  t.tm_sec = 0;
+  t.tm_isdst = 0;
+  time_t epoch = mktime(&t);
+  struct timeval tv = { epoch, 0 };
+  settimeofday(&tv, nullptr);
 }
 
 void saveWifiCreds(const String &ssid, const String &pass) {
@@ -844,14 +885,24 @@ void drawDigitGroupLabel(const char* label, int groupX, int groupW, int y) {
 void drawCountdownFrame() {
   tft.fillRect(0, 30, 320, 190, COLOR_BG);
 
-  if (!hasWifiCreds) {
-    printCentered("WI-FI NOT SET UP", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
-    printCentered("(tap the wrench to configure)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+  // Unified gating: !hasWallClock covers both "never synced" (online path)
+  // AND "never manually set" (offline path) in one check, since either one
+  // leaves the clock unusable. The message branches on hasWifiCreds so an
+  // offline (manually-set clock, no Wi-Fi) device doesn't wrongly show a
+  // Wi-Fi nag once its clock has been set.
+  if (!hasWallClock) {
+    if (hasWifiCreds) {
+      printCentered("SYNCING TIME...", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
+      printCentered("(waiting on Wi-Fi/NTP)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+    } else {
+      printCentered("SET UP WI-FI OR SET TIME", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
+      printCentered("(tap the wrench - Settings)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+    }
     return;
   }
-  if (!hasWallClock) {
-    printCentered("WAITING FOR WI-FI", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
-    printCentered("(clock not set yet)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+  if (!hasCoords) {
+    printCentered("NO LOCATION SET", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
+    printCentered("(tap the wrench - Settings)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
     return;
   }
   if (needsGeocode) {
@@ -934,6 +985,39 @@ void updateCountdown() {
 }
 
 // =========================================================================
+// Screen: first-run setup choice — shown once, before setupDone is true.
+// Offers the existing Wi-Fi flow (auto time + auto location) or a fully
+// offline path (manual SET TIME + pick-a-city, no network ever required).
+// =========================================================================
+void drawFirstRunScreen() {
+  tft.fillScreen(COLOR_BG);
+  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
+  printCentered("WELCOME - SET UP CLOCK", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+
+  tft.fillRoundRect(20, 50, 280, 80, 10, COLOR_PANEL);
+  tft.drawRoundRect(20, 50, 280, 80, 10, COLOR_PANEL_EDGE);
+  printCentered("CONNECT TO WI-FI", 160, 75, 2, COLOR_INFO, COLOR_PANEL);
+  printCentered("auto time + auto location", 160, 105, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
+
+  tft.fillRoundRect(20, 145, 280, 80, 10, COLOR_PANEL);
+  tft.drawRoundRect(20, 145, 280, 80, 10, COLOR_ACCENT);
+  printCentered("SET TIME + CITY", 160, 165, 2, COLOR_ACCENT, COLOR_PANEL);
+  printCentered("offline, no network needed", 160, 195, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
+}
+
+void handleFirstRunTouch(int16_t x, int16_t y) {
+  if (x < 20 || x > 300) return;
+  if (y >= 50 && y <= 130) {
+    firstRunActive = true;
+    startTextEntry(TXT_SSID, 32, currentSsid);
+  } else if (y >= 145 && y <= 225) {
+    firstRunActive = true;
+    startKeypad(KP_YEAR, 4);
+  }
+}
+
+// =========================================================================
 // Screen drawing: settings menu
 // =========================================================================
 // =========================================================================
@@ -1006,23 +1090,39 @@ void drawSettingsMenu() {
   tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
   printCentered("SETTINGS", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
 
-  // Seven rows now (CITY added alongside ZIP CODE) — tighter spacing than
-  // the six-row layout so they still all fit within the 240px screen height.
-  const char* labels[7] = { "ZIP CODE", "CITY", "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "BACK" };
-  for (int i = 0; i < 7; i++) {
-    int y = 30 + i * 29;
-    bool isBack = (i == 6);
-    tft.fillRoundRect(20, y, 280, 26, 7, COLOR_PANEL);
-    tft.drawRoundRect(20, y, 280, 26, 7, isBack ? COLOR_ACCENT : COLOR_PANEL_EDGE);
-    printCentered(labels[i], 160, y + 6, 2, isBack ? COLOR_ACCENT : COLOR_INFO, COLOR_PANEL);
+  // ZIP CODE and CITY render as two half-width buttons side by side in one
+  // row — a visual cue that they're alternatives, not two separate settings
+  // — which frees up vertical space for the remaining rows to breathe.
+  const int rowH = 28, rowStep = 34, top = 30;
+
+  tft.fillRoundRect(20, top, 135, rowH, 7, COLOR_PANEL);
+  tft.drawRoundRect(20, top, 135, rowH, 7, COLOR_PANEL_EDGE);
+  printCentered("ZIP CODE", 87, top + 8, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRoundRect(165, top, 135, rowH, 7, COLOR_PANEL);
+  tft.drawRoundRect(165, top, 135, rowH, 7, COLOR_PANEL_EDGE);
+  printCentered("CITY", 232, top + 8, 1, COLOR_INFO, COLOR_PANEL);
+
+  const char* labels[5] = { "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "BACK" };
+  for (int i = 0; i < 5; i++) {
+    int y = top + (i + 1) * rowStep;
+    bool isBack = (i == 4);
+    tft.fillRoundRect(20, y, 280, rowH, 7, COLOR_PANEL);
+    tft.drawRoundRect(20, y, 280, rowH, 7, isBack ? COLOR_ACCENT : COLOR_PANEL_EDGE);
+    printCentered(labels[i], 160, y + 7, 2, isBack ? COLOR_ACCENT : COLOR_INFO, COLOR_PANEL);
   }
 }
 
 int settingsMenuHit(int16_t x, int16_t y) {
+  const int rowH = 28, rowStep = 34, top = 30;
+  if (y >= top && y <= top + rowH) {
+    if (x >= 20 && x < 155) return 0;   // ZIP CODE (left half)
+    if (x >= 165 && x <= 300) return 1; // CITY (right half)
+    return -1;
+  }
   if (x < 20 || x > 300) return -1;
-  for (int i = 0; i < 7; i++) {
-    int ry = 30 + i * 29;
-    if (y >= ry && y <= ry + 26) return i;
+  for (int i = 0; i < 5; i++) {
+    int ry = top + (i + 1) * rowStep;
+    if (y >= ry && y <= ry + rowH) return i + 2;
   }
   return -1;
 }
@@ -1194,12 +1294,29 @@ void handleKeypadTouch(int16_t x, int16_t y) {
         break;
       case KP_MINUTE: {
         tmpMinute = constrain(keypadBuffer.toInt(), 0, 59);
-        time_t enteredLocalEpoch = utcToEpoch(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute, 0);
-        time_t nowUtc = time(nullptr);
-        localUtcOffsetSeconds = (long)(enteredLocalEpoch - nowUtc);
-        saveUtcOffset();
+        if (hasWifiCreds) {
+          // Online path: derive the local UTC offset by comparing the
+          // entered local time against the NTP-verified system clock.
+          time_t enteredLocalEpoch = utcToEpoch(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute, 0);
+          time_t nowUtc = time(nullptr);
+          localUtcOffsetSeconds = (long)(enteredLocalEpoch - nowUtc);
+          saveUtcOffset();
+        } else {
+          // Offline path: no NTP reference exists at all, so set the
+          // system clock directly to the entered LOCAL time and keep the
+          // offset at 0 — a self-consistent epoch+offset pair is all
+          // formatLocalTime()/computeShabbatTimes() need.
+          setSystemTimeManually(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute);
+          localUtcOffsetSeconds = 0;
+          saveUtcOffset();
+          hasWallClock = true;
+        }
         if (hasCoords) computeShabbatTimes();
-        screen = SCR_SETTINGS; drawSettingsMenu();
+        if (firstRunActive) {
+          cityListTop = 0; screen = SCR_CITY_LIST; drawCityListScreen();
+        } else {
+          screen = SCR_SETTINGS; drawSettingsMenu();
+        }
         break;
       }
     }
@@ -1369,8 +1486,18 @@ void handleTextPadTouch(int16_t x, int16_t y) {
       startTextEntry(TXT_PASSWORD, 63, currentPass);
     } else {
       saveWifiCreds(pendingSsid, textBuffer);
-      screen = SCR_SETTINGS;
-      drawSettingsMenu();
+      if (firstRunActive) {
+        // Wi-Fi path considers first-run setup complete once creds are
+        // saved — NTP sync and geocoding continue in the background as
+        // normal from here (see saveWifiCreds()/loop()).
+        markSetupDone();
+        firstRunActive = false;
+        screen = SCR_CLOCK;
+        drawStaticUI();
+      } else {
+        screen = SCR_SETTINGS;
+        drawSettingsMenu();
+      }
     }
   }
 }
@@ -1394,6 +1521,16 @@ void setup() {
 
   computeClockLayout();
   touchInit();
+
+  if (!setupDone) {
+    // First boot: show the Wi-Fi vs. offline choice instead of jumping
+    // straight into the normal auto-NTP/auto-geocode boot sequence —
+    // neither is meaningful until the user has picked a path.
+    firstRunActive = true;
+    screen = SCR_FIRST_RUN;
+    drawFirstRunScreen();
+    return;
+  }
 
   // Bounded attempt at boot — if no network shows up within the timeout,
   // we carry on without one instead of hanging here forever. loop() keeps
@@ -1486,6 +1623,10 @@ void loop() {
 
     case SCR_CITY_LIST:
       if (pressed) handleCityListTouch(x, y);
+      break;
+
+    case SCR_FIRST_RUN:
+      if (pressed) handleFirstRunTouch(x, y);
       break;
   }
 }
