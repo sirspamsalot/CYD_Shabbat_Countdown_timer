@@ -155,6 +155,7 @@ const int DEFAULT_BRIGHTNESS_PCT = 100;
 #define COLOR_ACCENT     0xD2E4  // ShabbatCon orange (#D65F22) — borders, dividers, captions
 #define COLOR_ACCENT_DIM 0x6962  // dim orange (#6B2F11) — secondary captions
 #define COLOR_INFO       0xCF5E  // soft blue-white (#CFE8F0) — general text
+#define COLOR_ZIP_TEXT   0x4B2E  // darker slate-teal (#4A6572) — dimmer than COLOR_INFO, used only for the header's ZIP label
 #define COLOR_DEL        0xB000  // muted red — DEL key accent, unchanged
 // -----------------------------------------------------------
 
@@ -182,6 +183,7 @@ time_t havdalahEpoch = 0;
 bool needsGeocode = false;
 unsigned long lastDisplayUpdate = 0;
 bool screenNeedsFullRedraw = true;
+String lastHeaderTime = ""; // last string drawn by drawHeaderTime(), so it only repaints on change
 
 // True once NTP has ever successfully set the system clock this session.
 // Nothing that depends on wall-clock time (geocode kickoff, Shabbat-time
@@ -741,7 +743,7 @@ void drawStaticUI() {
   String zipText = "ZIP " + currentZip;
   tft.setFont(&FreeSansBold9pt7b);
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_INFO, COLOR_PANEL);
+  tft.setTextColor(COLOR_ZIP_TEXT, COLOR_PANEL);
   int16_t zbx, zby; uint16_t zbw, zbh;
   tft.getTextBounds(zipText.c_str(), 0, 0, &zbx, &zby, &zbw, &zbh);
   tft.setCursor(34 - zbx, 9 - zby); // top-left at (34,9), vertically balanced with the candle icons
@@ -754,6 +756,31 @@ void drawStaticUI() {
 
   for (int i = 0; i < 7; i++) lastDigits[i] = -1;
   screenNeedsFullRedraw = true;
+  lastHeaderTime = "\x01"; // sentinel: force drawHeaderTime() to redraw on next call
+  drawHeaderTime();
+}
+
+// Live clock-of-day readout in the header, between the ZIP label and the
+// wrench icon. Only drawn once we actually have a synced wall clock; kept
+// blank until then rather than showing a meaningless time. Cheap to call
+// every second — it only repaints its small region, and only when the
+// displayed string actually changes (once a minute), so there's no flicker.
+void drawHeaderTime() {
+  String t = hasWallClock ? formatLocalTime(time(nullptr)) : "";
+  if (t == lastHeaderTime) return;
+  lastHeaderTime = t;
+
+  tft.fillRect(150, 1, 128, 28, COLOR_PANEL); // clear previous text, stay clear of the wrench hit target
+  if (t.length() == 0) return;
+
+  tft.setFont(&FreeSansBold9pt7b);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_ZIP_TEXT, COLOR_PANEL);
+  int16_t tbx, tby; uint16_t tbw, tbh;
+  tft.getTextBounds(t.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+  tft.setCursor(278 - tbw - tbx, 9 - tby); // right-aligned, ending just left of the wrench
+  tft.print(t);
+  tft.setFont();
 }
 
 void drawCountdownFrame() {
@@ -1304,6 +1331,7 @@ void loop() {
           screenNeedsFullRedraw = false;
         }
         updateCountdown();
+        drawHeaderTime();
       }
       break;
 
