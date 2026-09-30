@@ -37,27 +37,27 @@
   needed to change, only the class name, includes, and pin/bus setup. See
   that file's own header comment for where it came from.
 
-  IMPORTANT — NOT YET VERIFIED ON REAL HARDWARE: I could not compile-test or
-  run this against the actual board from this environment. The driver class,
-  pins, and shared-SPI-bus wiring are taken directly from LCDWiki's own
-  product page, and the display init sequence is the one already used for
-  this exact chip/panel combination by an existing open-source project — but
-  this specific file has not been flashed onto real hardware. Two things
-  most likely to need adjustment once you do:
-    - Resistive touch calibration (TS_MINX/MAXX/MINY/MAXY below) is carried
-      over UNCHANGED from the CYD sketch's values, which were for a
-      different physical touch digitizer — treat them as a starting guess,
-      not a known-good value, and recalibrate using the TOUCH_DEBUG toggle
-      near the touch driver code if taps land off-target.
-    - Screen layout currently occupies the same 320x240 region the CYD
-      sketch draws into, anchored at the top-left of this panel's larger
-      480x320 canvas — meaning a working first flash will show the full UI
-      correctly, but with unused black margin on the right and bottom
-      rather than filling the bigger screen. Rescaling every button/menu
-      coordinate to use the full 480x320 canvas is a worthwhile follow-up
-      once this base port is confirmed working, but was deliberately not
-      attempted blind in this same pass, to avoid stacking two sets of
-      unverified changes (new hardware AND new layout math) at once.
+  UPDATE — layout now fills the full 480x320 canvas: every screen (header,
+  clock digits, settings menu, keypad, text keyboard, city list, etc.) is
+  laid out against SCR_W/SCR_H/CX near the top of this file instead of the
+  CYD's original hardcoded 320x240 coordinates, based on real-hardware
+  feedback that the first pass only drew into the top-left 320x240 corner.
+
+  IMPORTANT — TOUCH STILL LIKELY NEEDS CALIBRATION: real hardware also
+  reported touch tracking incorrectly. Two independent things can cause
+  that, and this pass fixes only the first automatically:
+    - The touch->pixel mapping now targets the full 0-479 / 0-319 range
+      (it previously only mapped onto the old 320x240 sub-region, which
+      alone would have made anything outside that corner untouchable).
+    - The four raw-ADC calibration numbers (TS_MINX/MAXX/MINY/MAXY) and
+      the axis order/direction are still UNVERIFIED guesses carried over
+      from the CYD's different, dedicated-bus touch digitizer. TOUCH_DEBUG
+      is on (prints raw ADC coordinates in the bottom-left corner on every
+      tap) and three new toggles — TOUCH_SWAP_XY / TOUCH_INVERT_X /
+      TOUCH_INVERT_Y, near the touch driver code — let you try axis
+      swaps/flips without hunting through the code, before re-deriving the
+      four calibration numbers from the raw values TOUCH_DEBUG prints. See
+      the README's Touch calibration section for the step-by-step process.
 
   Display style: big seven-segment-style digits on black, in the spirit of
   the countdown clock from "Studio 60 on the Sunset Strip"'s title
@@ -167,6 +167,30 @@ const int DEFAULT_BRIGHTNESS_PCT = 50;
 #define BL_PWM_RES     8
 // ------------------------------------------------
 
+// ---------- Full-canvas layout constants ----------
+// This panel is 480x320 in landscape (tft.setRotation(1)) — noticeably
+// wider AND taller than the CYD/ES3C28P sketches' 320x240. Every screen
+// below is laid out against these two numbers (and CX, the horizontal
+// center) instead of the CYD's original hardcoded 320x240 coordinates, so
+// the UI now fills the whole physical panel instead of only its top-left
+// 320x240 corner.
+#define SCR_W 480
+#define SCR_H 320
+#define CX (SCR_W / 2)
+
+// Wrench settings button (top-right of the header) and its touch target.
+#define GEAR_X (SCR_W - 21)
+#define GEAR_Y 15
+#define GEAR_HIT_X0 (GEAR_X - 14)
+#define GEAR_HIT_X1 (GEAR_X + 14)
+#define GEAR_HIT_Y0 2
+#define GEAR_HIT_Y1 28
+// Right edge that header-time text right-aligns against, and the left edge
+// of the region cleared before redrawing it (see drawHeaderTime()).
+#define HDR_TIME_RIGHT (GEAR_HIT_X0 - 6)
+#define HDR_TIME_LEFT  200
+// ------------------------------------------------
+
 // ---------- Countdown digit palette (Studio 60-style LED look) ----------
 #define COLOR_BG      0x0000   // black
 #define COLOR_SEG_ON  0x0393   // ShabbatCon blue (#00719F) — lit segment
@@ -250,25 +274,40 @@ int textMaxLen = 32;
 String pendingSsid = ""; // holds the SSID between the SSID and password steps
 
 // ---------------- Touch driver: XPT2046 (resistive, shares the display's SPI bus) ----------------
-// Raw ADC range the touch controller reports at each axis extreme, mapped
-// onto the 320x240 region this sketch currently draws into (see the layout
-// note near the top of this file). CARRIED OVER UNCHANGED from the CYD
-// sketch's values — those were calibrated for a different physical touch
-// digitizer, so treat these four numbers as an untested starting guess for
-// THIS panel, not a known-good value. If taps land off-target (likely, on
-// first flash), flip TOUCH_DEBUG to 1 below, tap a few known points, and
-// adjust these four numbers (and/or swap p.x/p.y below, or flip a map()
-// range) until it tracks correctly — same empirical process used to
-// calibrate each of this project's other hardware targets.
+// Raw ADC range the touch controller reports at each axis extreme, now
+// mapped onto the FULL 480x320 canvas (see SCR_W/SCR_H above) instead of
+// the old 320x240 sub-region. CARRIED OVER UNCHANGED from the CYD sketch's
+// values — those were calibrated for a different physical touch digitizer
+// on a separate SPI bus, so treat these four numbers as an untested
+// starting guess for THIS panel, not a known-good value. TOUCH_DEBUG below
+// is already on, so the raw ADC reading is printed in the bottom-left
+// corner on every tap — tap the four corners of the screen, note the raw
+// numbers, and adjust TS_MINX/MAXX/MINY/MAXY until they bracket what you
+// see (min at the top-left-most reading, max at the bottom-right-most).
 #define TS_MINX 200
 #define TS_MAXX 3700
 #define TS_MINY 240
 #define TS_MAXY 3800
 
+// If taps land in a plausible-but-wrong spot after the four numbers above
+// are dialed in — e.g. dragging left-to-right moves the cursor up-and-down
+// instead — the axes are probably transposed and/or flipped rather than
+// just mis-scaled, which four min/max numbers alone can't fix. A
+// shared-SPI-bus touch controller (this board) can easily come out with a
+// different axis order/direction than a dedicated-bus one (the CYD), and
+// this wiring hasn't been verified against real hardware. Try toggling
+// these one at a time (reflash after each change) before re-deriving the
+// four calibration numbers above:
+#define TOUCH_SWAP_XY   0   // 1 = swap X and Y before mapping (try this first if axes feel transposed)
+#define TOUCH_INVERT_X  0   // 1 = flip left/right
+#define TOUCH_INVERT_Y  0   // 1 = flip up/down
+
 // Set to 1 to print raw touch ADC coordinates in the corner of the screen
-// on every tap, for recalibrating the four constants above. Leave at 0
-// for normal use.
-#define TOUCH_DEBUG 0
+// on every tap, for recalibrating the constants above. Leave at 0 for
+// normal use. TEMPORARILY SET TO 1 for calibrating this board — see the
+// README's Touch calibration section for how to use it, then set back to
+// 0 once TS_MINX/MAXX/MINY/MAXY above are updated with your real values.
+#define TOUCH_DEBUG 1
 
 bool touchInit() {
   // Shares tftSPI with the display (see the pin note near the top of this
@@ -282,19 +321,32 @@ bool touchInit() {
 bool getTouchPoint(int16_t &x, int16_t &y) {
   if (!ts.touched()) return false;
   TS_Point p = ts.getPoint();
+  int32_t rawX = p.x, rawY = p.y;
 
 #if TOUCH_DEBUG
-  tft.fillRect(0, 231, 140, 9, COLOR_BG);
+  tft.fillRect(0, SCR_H - 9, 160, 9, COLOR_BG);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_INFO, COLOR_BG);
-  tft.setCursor(0, 232);
-  tft.print(p.x); tft.print(","); tft.print(p.y);
+  tft.setCursor(0, SCR_H - 8);
+  tft.print(rawX); tft.print(","); tft.print(rawY);
 #endif
 
-  x = map(p.x, TS_MINX, TS_MAXX, 0, 319);
-  y = map(p.y, TS_MINY, TS_MAXY, 0, 239);
-  x = constrain(x, 0, 319);
-  y = constrain(y, 0, 239);
+#if TOUCH_SWAP_XY
+  int32_t tmp = rawX; rawX = rawY; rawY = tmp;
+#endif
+
+  x = map(rawX, TS_MINX, TS_MAXX, 0, SCR_W - 1);
+  y = map(rawY, TS_MINY, TS_MAXY, 0, SCR_H - 1);
+
+#if TOUCH_INVERT_X
+  x = (SCR_W - 1) - x;
+#endif
+#if TOUCH_INVERT_Y
+  y = (SCR_H - 1) - y;
+#endif
+
+  x = constrain(x, 0, SCR_W - 1);
+  y = constrain(y, 0, SCR_H - 1);
   return true;
 }
 
@@ -320,9 +372,9 @@ bool attemptNtpSync(unsigned long wifiTimeoutMs, unsigned long ntpTimeoutMs, boo
   int dotsY = 0;
   if (showUI) {
     tft.fillScreen(COLOR_BG);
-    drawCandleIcon(148, 100);
-    drawCandleIcon(168, 100);
-    printCentered("CONNECTING TO WI-FI", 160, 130, 2, COLOR_ACCENT_DIM, COLOR_BG);
+    drawCandleIcon(CX - 12, 100);
+    drawCandleIcon(CX + 8, 100);
+    printCentered("CONNECTING TO WI-FI", CX, 130, 2, COLOR_ACCENT_DIM, COLOR_BG);
     tft.setFont(&FreeSansBold12pt7b);
     tft.setTextSize(1);
     tft.setTextColor(COLOR_ACCENT_DIM, COLOR_BG);
@@ -554,8 +606,8 @@ bool fetchTimezoneForCoords(double lat, double lon) {
 }
 
 void doGeocode() {
-  tft.fillRect(0, 30, 320, 190, COLOR_BG);
-  printCentered("LOCATING...", 160, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
+  tft.fillRect(0, 30, SCR_W, SCR_H - 30, COLOR_BG);
+  printCentered("LOCATING...", CX, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
   if (geocodeZip(currentZip)) {
     saveCoords(latitude, longitude);
     needsGeocode = false;
@@ -577,8 +629,8 @@ void doGeocode() {
     // background NTP retry will call computeShabbatTimes() itself the
     // moment the clock syncs, now that hasCoords is true.
   } else {
-    printCentered("ZIP LOOKUP FAILED", 160, 100, 2, 0xF800, COLOR_BG);
-    printCentered("Check ZIP in Settings & retry", 160, 132, 1, COLOR_ACCENT_DIM, COLOR_BG);
+    printCentered("ZIP LOOKUP FAILED", CX, 100, 2, 0xF800, COLOR_BG);
+    printCentered("Check ZIP in Settings & retry", CX, 132, 1, COLOR_ACCENT_DIM, COLOR_BG);
     delay(4000);
     needsGeocode = false; // stop retry-looping; user must re-enter ZIP
   }
@@ -882,11 +934,14 @@ void drawColon(int x, int y, int h) {
 }
 
 // ---------- Clock layout: D : HH : MM : SS, fixed width, centered ----------
-#define DIGIT_W 30
-#define DIGIT_H 54
-#define COLON_W 14
-#define SEG_GAP 5
-#define CLOCK_Y 82
+// Bigger than the CYD/ES3C28P's digits (30x54) since this panel's 480-wide
+// canvas has the room for it — sized so the whole 7-digit group plus
+// colons fills most of the 480px width with even margins either side.
+#define DIGIT_W 44
+#define DIGIT_H 80
+#define COLON_W 20
+#define SEG_GAP 8
+#define CLOCK_Y 95
 
 int digitX[7];
 int colonX[3];
@@ -894,7 +949,7 @@ int lastDigits[7] = { -1, -1, -1, -1, -1, -1, -1 };
 
 void computeClockLayout() {
   int totalW = 7 * DIGIT_W + 3 * COLON_W + 9 * SEG_GAP;
-  int startX = (320 - totalW) / 2;
+  int startX = (SCR_W - totalW) / 2;
   int x = startX;
 
   digitX[0] = x; x += DIGIT_W + SEG_GAP;
@@ -929,8 +984,8 @@ void updateClockDigits(int d, int h1, int h2, int m1, int m2, int s1, int s2, bo
 void drawStaticUI() {
   tft.fillScreen(COLOR_BG);
 
-  tft.fillRect(0, 0, 320, 30, COLOR_PANEL);
-  tft.drawFastHLine(0, 30, 320, COLOR_ACCENT);
+  tft.fillRect(0, 0, SCR_W, 30, COLOR_PANEL);
+  tft.drawFastHLine(0, 30, SCR_W, COLOR_ACCENT);
 
   drawCandleIcon(8, 14);
   drawCandleIcon(18, 14);
@@ -945,8 +1000,8 @@ void drawStaticUI() {
   tft.setFont(); // reset to built-in font
 
   // Wrench settings button, top-right (no visible box; the tap target in
-  // loop() is still the same 286-312 x 2-28 region the box used to outline)
-  drawGearIcon(299, 15, 7);
+  // loop() is still the same GEAR_HIT_* region the box used to outline)
+  drawGearIcon(GEAR_X, GEAR_Y, 7);
 
   for (int i = 0; i < 7; i++) lastDigits[i] = -1;
   screenNeedsFullRedraw = true;
@@ -964,7 +1019,7 @@ void drawHeaderTime() {
   if (t == lastHeaderTime) return;
   lastHeaderTime = t;
 
-  tft.fillRect(150, 1, 128, 28, COLOR_PANEL); // clear previous text, stay clear of the wrench hit target
+  tft.fillRect(HDR_TIME_LEFT, 1, HDR_TIME_RIGHT - HDR_TIME_LEFT, 28, COLOR_PANEL); // clear previous text, stay clear of the wrench hit target
   if (t.length() == 0) return;
 
   tft.setFont(&FreeSansBold9pt7b);
@@ -972,7 +1027,7 @@ void drawHeaderTime() {
   tft.setTextColor(COLOR_ZIP_TEXT, COLOR_PANEL);
   int16_t tbx, tby; uint16_t tbw, tbh;
   tft.getTextBounds(t.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
-  tft.setCursor(278 - tbw - tbx, 9 - tby); // right-aligned, ending just left of the wrench
+  tft.setCursor(HDR_TIME_RIGHT - tbw - tbx, 9 - tby); // right-aligned, ending just left of the wrench
   tft.print(t);
   tft.setFont();
 }
@@ -991,7 +1046,7 @@ void drawDigitGroupLabel(const char* label, int groupX, int groupW, int y) {
 }
 
 void drawCountdownFrame() {
-  tft.fillRect(0, 30, 320, 190, COLOR_BG);
+  tft.fillRect(0, 30, SCR_W, SCR_H - 30, COLOR_BG);
 
   // Unified gating: !hasWallClock covers both "never synced" (online path)
   // AND "never manually set" (offline path) in one check, since either one
@@ -1000,29 +1055,29 @@ void drawCountdownFrame() {
   // Wi-Fi nag once its clock has been set.
   if (!hasWallClock) {
     if (hasWifiCreds) {
-      printCentered("SYNCING TIME...", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
-      printCentered("(waiting on Wi-Fi/NTP)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+      printCentered("SYNCING TIME...", CX, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
+      printCentered("(waiting on Wi-Fi/NTP)", CX, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
     } else {
-      printCentered("SET UP WI-FI OR SET TIME", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
-      printCentered("(tap the wrench - Settings)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+      printCentered("SET UP WI-FI OR SET TIME", CX, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
+      printCentered("(tap the wrench - Settings)", CX, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
     }
     return;
   }
   if (!hasCoords) {
-    printCentered("NO LOCATION SET", 160, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
-    printCentered("(tap the wrench - Settings)", 160, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
+    printCentered("NO LOCATION SET", CX, 95, 2, COLOR_ACCENT_DIM, COLOR_BG);
+    printCentered("(tap the wrench - Settings)", CX, 125, 1, COLOR_ACCENT_DIM, COLOR_BG);
     return;
   }
   if (needsGeocode) {
-    printCentered("LOCATING...", 160, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
+    printCentered("LOCATING...", CX, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
     return;
   }
   if (candleLightingEpoch == 0 || havdalahEpoch == 0) {
-    printCentered("CALCULATING...", 160, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
+    printCentered("CALCULATING...", CX, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
     return;
   }
 
-  printCentered("TIME REMAINING", 160, 40, 3, COLOR_ACCENT, COLOR_BG);
+  printCentered("TIME REMAINING", CX, 40, 3, COLOR_ACCENT, COLOR_BG);
 
   int fx0 = digitX[0] - 14, fy0 = CLOCK_Y - 12;
   int fx1 = digitX[6] + DIGIT_W + 14, fy1 = CLOCK_Y + DIGIT_H + 22;
@@ -1035,8 +1090,8 @@ void drawCountdownFrame() {
   // in the remaining space below the clock frame down to the bottom of the
   // content area — rather than each line centered in its own half, which
   // could visually skew the pair off-center as a group.
-  int areaTop = fy1 + 8;     // just under the frame
-  int areaBottom = 216;      // near the bottom of the drawable content region
+  int areaTop = fy1 + 8;       // just under the frame
+  int areaBottom = SCR_H - 20; // near the bottom of the drawable content region
   int areaHeight = areaBottom - areaTop;
 
   tft.setFont(chromeFont(2));
@@ -1052,8 +1107,8 @@ void drawCountdownFrame() {
   int line1Y = blockTop;
   int line2Y = blockTop + lineH + lineGap;
 
-  printCentered(candleLine.c_str(), 160, line1Y, 2, COLOR_INFO, COLOR_BG);
-  printCentered(havdalahLine.c_str(), 160, line2Y, 2, COLOR_INFO, COLOR_BG);
+  printCentered(candleLine.c_str(), CX, line1Y, 2, COLOR_INFO, COLOR_BG);
+  printCentered(havdalahLine.c_str(), CX, line2Y, 2, COLOR_INFO, COLOR_BG);
 
   // D / HH / MM / SS labels, each centered under its digit group rather than
   // left-anchored at a fixed offset.
@@ -1100,27 +1155,27 @@ void updateCountdown() {
 // =========================================================================
 void drawFirstRunScreen() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
-  printCentered("WELCOME - SET UP CLOCK", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
+  printCentered("WELCOME - SET UP CLOCK", CX, 5, 1, COLOR_INFO, COLOR_PANEL);
 
-  tft.fillRoundRect(20, 50, 280, 80, 10, COLOR_PANEL);
-  tft.drawRoundRect(20, 50, 280, 80, 10, COLOR_PANEL_EDGE);
-  printCentered("CONNECT TO WI-FI", 160, 75, 2, COLOR_INFO, COLOR_PANEL);
-  printCentered("auto time - set location after", 160, 105, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
+  tft.fillRoundRect(40, 60, 400, 100, 10, COLOR_PANEL);
+  tft.drawRoundRect(40, 60, 400, 100, 10, COLOR_PANEL_EDGE);
+  printCentered("CONNECT TO WI-FI", CX, 90, 2, COLOR_INFO, COLOR_PANEL);
+  printCentered("auto time - set location after", CX, 125, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
 
-  tft.fillRoundRect(20, 145, 280, 80, 10, COLOR_PANEL);
-  tft.drawRoundRect(20, 145, 280, 80, 10, COLOR_ACCENT);
-  printCentered("SET TIME + CITY", 160, 165, 2, COLOR_ACCENT, COLOR_PANEL);
-  printCentered("offline, no network needed", 160, 195, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
+  tft.fillRoundRect(40, 190, 400, 100, 10, COLOR_PANEL);
+  tft.drawRoundRect(40, 190, 400, 100, 10, COLOR_ACCENT);
+  printCentered("SET TIME + CITY", CX, 220, 2, COLOR_ACCENT, COLOR_PANEL);
+  printCentered("offline, no network needed", CX, 255, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
 }
 
 void handleFirstRunTouch(int16_t x, int16_t y) {
-  if (x < 20 || x > 300) return;
-  if (y >= 50 && y <= 130) {
+  if (x < 40 || x > 440) return;
+  if (y >= 60 && y <= 160) {
     firstRunActive = true;
     startTextEntry(TXT_SSID, 32, currentSsid);
-  } else if (y >= 145 && y <= 225) {
+  } else if (y >= 190 && y <= 290) {
     firstRunActive = true;
     startKeypad(KP_YEAR, 4);
   }
@@ -1136,40 +1191,49 @@ void handleFirstRunTouch(int16_t x, int16_t y) {
 // immediately (no separate OK step needed — a tap already is the "select").
 // =========================================================================
 #define CITY_ROWS_VISIBLE 6
-#define CITY_ROW_H 30
+#define CITY_ROW_H 40
+#define CITY_ROW_W 380
+#define CITY_LIST_TOP 30
+#define CITY_ARROW_X 400
+#define CITY_ARROW_W 60
+#define CITY_BACK_Y 280
 
 void drawCityListScreen() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
-  printCentered("SELECT CITY", 160, 4, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
+  printCentered("SELECT CITY", CX, 4, 1, COLOR_INFO, COLOR_PANEL);
 
   for (int i = 0; i < CITY_ROWS_VISIBLE; i++) {
     int idx = cityListTop + i;
     if (idx >= CITY_COUNT) break;
-    int y = 30 + i * CITY_ROW_H;
-    tft.fillRoundRect(10, y, 258, CITY_ROW_H - 3, 5, COLOR_PANEL);
-    tft.drawRoundRect(10, y, 258, CITY_ROW_H - 3, 5, COLOR_PANEL_EDGE);
-    printCentered(CITY_LIST[idx].name, 139, y + 6, 1, COLOR_INFO, COLOR_PANEL);
+    int y = CITY_LIST_TOP + i * CITY_ROW_H;
+    tft.fillRoundRect(10, y, CITY_ROW_W, CITY_ROW_H - 3, 5, COLOR_PANEL);
+    tft.drawRoundRect(10, y, CITY_ROW_W, CITY_ROW_H - 3, 5, COLOR_PANEL_EDGE);
+    printCentered(CITY_LIST[idx].name, 10 + CITY_ROW_W / 2, y + 10, 1, COLOR_INFO, COLOR_PANEL);
   }
 
-  tft.fillRoundRect(276, 30, 34, 88, 6, COLOR_PANEL);
-  tft.drawRoundRect(276, 30, 34, 88, 6, COLOR_PANEL_EDGE);
-  printCentered("^", 293, 46, 2, COLOR_INFO, COLOR_PANEL);
-  tft.fillRoundRect(276, 122, 34, 88, 6, COLOR_PANEL);
-  tft.drawRoundRect(276, 122, 34, 88, 6, COLOR_PANEL_EDGE);
-  printCentered("v", 293, 138, 2, COLOR_INFO, COLOR_PANEL);
+  int arrowH = (CITY_ROWS_VISIBLE * CITY_ROW_H - 4) / 2;
+  tft.fillRoundRect(CITY_ARROW_X, CITY_LIST_TOP, CITY_ARROW_W, arrowH, 6, COLOR_PANEL);
+  tft.drawRoundRect(CITY_ARROW_X, CITY_LIST_TOP, CITY_ARROW_W, arrowH, 6, COLOR_PANEL_EDGE);
+  printCentered("^", CITY_ARROW_X + CITY_ARROW_W / 2, CITY_LIST_TOP + arrowH / 2 - 12, 2, COLOR_INFO, COLOR_PANEL);
+  int arrow2Y = CITY_LIST_TOP + arrowH + 4;
+  tft.fillRoundRect(CITY_ARROW_X, arrow2Y, CITY_ARROW_W, arrowH, 6, COLOR_PANEL);
+  tft.drawRoundRect(CITY_ARROW_X, arrow2Y, CITY_ARROW_W, arrowH, 6, COLOR_PANEL_EDGE);
+  printCentered("v", CITY_ARROW_X + CITY_ARROW_W / 2, arrow2Y + arrowH / 2 - 12, 2, COLOR_INFO, COLOR_PANEL);
 
-  tft.fillRoundRect(110, 210, 100, 26, 8, COLOR_ACCENT);
-  printCentered("BACK", 160, 215, 1, COLOR_BG, COLOR_ACCENT);
+  tft.fillRoundRect(CX - 80, CITY_BACK_Y, 160, 34, 8, COLOR_ACCENT);
+  printCentered("BACK", CX, CITY_BACK_Y + 9, 1, COLOR_BG, COLOR_ACCENT);
 }
 
 void handleCityListTouch(int16_t x, int16_t y) {
-  if (x >= 276 && x <= 310) {
-    if (y >= 30 && y <= 118) {
+  int arrowH = (CITY_ROWS_VISIBLE * CITY_ROW_H - 4) / 2;
+  int arrow2Y = CITY_LIST_TOP + arrowH + 4;
+  if (x >= CITY_ARROW_X && x <= CITY_ARROW_X + CITY_ARROW_W) {
+    if (y >= CITY_LIST_TOP && y <= CITY_LIST_TOP + arrowH) {
       cityListTop = max(0, cityListTop - CITY_ROWS_VISIBLE);
       drawCityListScreen();
-    } else if (y >= 122 && y <= 210) {
+    } else if (y >= arrow2Y && y <= arrow2Y + arrowH) {
       int maxTop = CITY_COUNT - CITY_ROWS_VISIBLE;
       if (maxTop < 0) maxTop = 0;
       cityListTop = min(maxTop, cityListTop + CITY_ROWS_VISIBLE);
@@ -1177,13 +1241,13 @@ void handleCityListTouch(int16_t x, int16_t y) {
     }
     return;
   }
-  if (x >= 110 && x <= 210 && y >= 210 && y <= 236) {
+  if (x >= CX - 80 && x <= CX + 80 && y >= CITY_BACK_Y && y <= CITY_BACK_Y + 34) {
     screen = SCR_SETTINGS;
     drawSettingsMenu();
     return;
   }
-  if (x >= 10 && x <= 268 && y >= 30 && y < 30 + CITY_ROWS_VISIBLE * CITY_ROW_H) {
-    int row = (y - 30) / CITY_ROW_H;
+  if (x >= 10 && x <= 10 + CITY_ROW_W && y >= CITY_LIST_TOP && y < CITY_LIST_TOP + CITY_ROWS_VISIBLE * CITY_ROW_H) {
+    int row = (y - CITY_LIST_TOP) / CITY_ROW_H;
     int idx = cityListTop + row;
     if (idx < CITY_COUNT) {
       selectCity(idx);
@@ -1195,43 +1259,48 @@ void handleCityListTouch(int16_t x, int16_t y) {
 
 void drawSettingsMenu() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
-  printCentered("SETTINGS", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
+  printCentered("SETTINGS", CX, 5, 1, COLOR_INFO, COLOR_PANEL);
 
   // ZIP CODE and CITY render as two half-width buttons side by side in one
   // row — a visual cue that they're alternatives, not two separate settings
   // — which frees up vertical space for the remaining rows to breathe.
-  // rowH/rowStep are trimmed slightly from their original 28/34 so the new
-  // SYSTEM RESET row still fits under the 240px screen height.
-  const int rowH = 26, rowStep = 30, top = 29;
+  // Sized to use the full 480px width and 320px height of this panel.
+  const int rowH = 30, rowStep = 36, top = 34, margin = 20;
+  const int fullW = SCR_W - 2 * margin;   // 440
+  const int halfW = (fullW - 16) / 2;     // 212, with a 16px gap between halves
 
-  tft.fillRoundRect(20, top, 135, rowH, 7, COLOR_PANEL);
-  tft.drawRoundRect(20, top, 135, rowH, 7, COLOR_PANEL_EDGE);
-  printCentered("ZIP CODE", 87, top + 7, 1, COLOR_INFO, COLOR_PANEL);
-  tft.fillRoundRect(165, top, 135, rowH, 7, COLOR_PANEL);
-  tft.drawRoundRect(165, top, 135, rowH, 7, COLOR_PANEL_EDGE);
-  printCentered("CITY", 232, top + 7, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRoundRect(margin, top, halfW, rowH, 7, COLOR_PANEL);
+  tft.drawRoundRect(margin, top, halfW, rowH, 7, COLOR_PANEL_EDGE);
+  printCentered("ZIP CODE", margin + halfW / 2, top + 8, 1, COLOR_INFO, COLOR_PANEL);
+  int cityX = margin + halfW + 16;
+  tft.fillRoundRect(cityX, top, halfW, rowH, 7, COLOR_PANEL);
+  tft.drawRoundRect(cityX, top, halfW, rowH, 7, COLOR_PANEL_EDGE);
+  printCentered("CITY", cityX + halfW / 2, top + 8, 1, COLOR_INFO, COLOR_PANEL);
 
   const char* labels[6] = { "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "SYSTEM RESET", "BACK" };
   for (int i = 0; i < 6; i++) {
     int y = top + (i + 1) * rowStep;
     bool isBack = (i == 5);
     bool isReset = (i == 4);
-    tft.fillRoundRect(20, y, 280, rowH, 7, COLOR_PANEL);
-    tft.drawRoundRect(20, y, 280, rowH, 7, isBack ? COLOR_ACCENT : (isReset ? COLOR_DEL : COLOR_PANEL_EDGE));
-    printCentered(labels[i], 160, y + 6, 2, isBack ? COLOR_ACCENT : (isReset ? COLOR_DEL : COLOR_INFO), COLOR_PANEL);
+    tft.fillRoundRect(margin, y, fullW, rowH, 7, COLOR_PANEL);
+    tft.drawRoundRect(margin, y, fullW, rowH, 7, isBack ? COLOR_ACCENT : (isReset ? COLOR_DEL : COLOR_PANEL_EDGE));
+    printCentered(labels[i], CX, y + 7, 2, isBack ? COLOR_ACCENT : (isReset ? COLOR_DEL : COLOR_INFO), COLOR_PANEL);
   }
 }
 
 int settingsMenuHit(int16_t x, int16_t y) {
-  const int rowH = 26, rowStep = 30, top = 29;
+  const int rowH = 30, rowStep = 36, top = 34, margin = 20;
+  const int fullW = SCR_W - 2 * margin;
+  const int halfW = (fullW - 16) / 2;
+  int cityX = margin + halfW + 16;
   if (y >= top && y <= top + rowH) {
-    if (x >= 20 && x < 155) return 0;   // ZIP CODE (left half)
-    if (x >= 165 && x <= 300) return 1; // CITY (right half)
+    if (x >= margin && x < margin + halfW) return 0; // ZIP CODE (left half)
+    if (x >= cityX && x <= cityX + halfW) return 1;  // CITY (right half)
     return -1;
   }
-  if (x < 20 || x > 300) return -1;
+  if (x < margin || x > margin + fullW) return -1;
   for (int i = 0; i < 6; i++) {
     int ry = top + (i + 1) * rowStep;
     if (y >= ry && y <= ry + rowH) return i + 2;
@@ -1270,21 +1339,21 @@ void handleSettingsTouch(int16_t x, int16_t y) {
 // =========================================================================
 void drawConfirmResetScreen() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
-  printCentered("SYSTEM RESET", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
+  printCentered("SYSTEM RESET", CX, 5, 1, COLOR_INFO, COLOR_PANEL);
 
-  printCentered("ARE YOU SURE?", 160, 45, 2, COLOR_ACCENT, COLOR_BG);
-  printCentered("erases wifi, location, time", 160, 78, 1, COLOR_ACCENT_DIM, COLOR_BG);
-  printCentered("and all settings", 160, 94, 1, COLOR_ACCENT_DIM, COLOR_BG);
+  printCentered("ARE YOU SURE?", CX, 55, 2, COLOR_ACCENT, COLOR_BG);
+  printCentered("erases wifi, location, time", CX, 90, 1, COLOR_ACCENT_DIM, COLOR_BG);
+  printCentered("and all settings", CX, 106, 1, COLOR_ACCENT_DIM, COLOR_BG);
 
-  tft.fillRoundRect(20, 145, 130, 70, 10, COLOR_PANEL);
-  tft.drawRoundRect(20, 145, 130, 70, 10, COLOR_DEL);
-  printCentered("YES, RESET", 85, 172, 1, COLOR_DEL, COLOR_PANEL);
+  tft.fillRoundRect(20, 180, 210, 90, 10, COLOR_PANEL);
+  tft.drawRoundRect(20, 180, 210, 90, 10, COLOR_DEL);
+  printCentered("YES, RESET", 125, 218, 1, COLOR_DEL, COLOR_PANEL);
 
-  tft.fillRoundRect(170, 145, 130, 70, 10, COLOR_PANEL);
-  tft.drawRoundRect(170, 145, 130, 70, 10, COLOR_ACCENT);
-  printCentered("CANCEL", 235, 172, 1, COLOR_ACCENT, COLOR_PANEL);
+  tft.fillRoundRect(250, 180, 210, 90, 10, COLOR_PANEL);
+  tft.drawRoundRect(250, 180, 210, 90, 10, COLOR_ACCENT);
+  printCentered("CANCEL", 355, 218, 1, COLOR_ACCENT, COLOR_PANEL);
 }
 
 // Wipes the entire "shabbat" Preferences namespace, resets in-RAM state to
@@ -1323,10 +1392,10 @@ void performSystemReset() {
 }
 
 void handleConfirmResetTouch(int16_t x, int16_t y) {
-  if (y < 145 || y > 215) return;
-  if (x >= 20 && x <= 150) {
+  if (y < 180 || y > 270) return;
+  if (x >= 20 && x <= 230) {
     performSystemReset();
-  } else if (x >= 170 && x <= 300) {
+  } else if (x >= 250 && x <= 460) {
     screen = SCR_SETTINGS; drawSettingsMenu();
   }
 }
@@ -1336,34 +1405,34 @@ void handleConfirmResetTouch(int16_t x, int16_t y) {
 // =========================================================================
 void drawBrightnessScreen() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
-  printCentered("BRIGHTNESS", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
+  printCentered("BRIGHTNESS", CX, 5, 1, COLOR_INFO, COLOR_PANEL);
 
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", brightnessPct);
-  printCentered(buf, 160, 80, 4, COLOR_ACCENT, COLOR_BG);
+  printCentered(buf, CX, 90, 4, COLOR_ACCENT, COLOR_BG);
 
-  tft.fillRoundRect(40, 150, 80, 50, 10, COLOR_PANEL);
-  tft.drawRoundRect(40, 150, 80, 50, 10, COLOR_PANEL_EDGE);
-  printCentered("-", 80, 160, 3, COLOR_INFO, COLOR_PANEL);
+  tft.fillRoundRect(60, 190, 110, 70, 10, COLOR_PANEL);
+  tft.drawRoundRect(60, 190, 110, 70, 10, COLOR_PANEL_EDGE);
+  printCentered("-", 115, 210, 3, COLOR_INFO, COLOR_PANEL);
 
-  tft.fillRoundRect(200, 150, 80, 50, 10, COLOR_PANEL);
-  tft.drawRoundRect(200, 150, 80, 50, 10, COLOR_PANEL_EDGE);
-  printCentered("+", 240, 160, 3, COLOR_INFO, COLOR_PANEL);
+  tft.fillRoundRect(310, 190, 110, 70, 10, COLOR_PANEL);
+  tft.drawRoundRect(310, 190, 110, 70, 10, COLOR_PANEL_EDGE);
+  printCentered("+", 365, 210, 3, COLOR_INFO, COLOR_PANEL);
 
-  tft.fillRoundRect(110, 210, 100, 26, 8, COLOR_ACCENT);
-  printCentered("DONE", 160, 215, 1, COLOR_BG, COLOR_ACCENT);
+  tft.fillRoundRect(190, 280, 100, 34, 8, COLOR_ACCENT);
+  printCentered("DONE", CX, 289, 1, COLOR_BG, COLOR_ACCENT);
 }
 
 void handleBrightnessTouch(int16_t x, int16_t y) {
-  if (x >= 40 && x <= 120 && y >= 150 && y <= 200) {
+  if (x >= 60 && x <= 170 && y >= 190 && y <= 260) {
     brightnessPct = max(10, brightnessPct - 10);
     applyBrightness(); saveBrightness(); drawBrightnessScreen();
-  } else if (x >= 200 && x <= 280 && y >= 150 && y <= 200) {
+  } else if (x >= 310 && x <= 420 && y >= 190 && y <= 260) {
     brightnessPct = min(100, brightnessPct + 10);
     applyBrightness(); saveBrightness(); drawBrightnessScreen();
-  } else if (x >= 110 && x <= 210 && y >= 210 && y <= 236) {
+  } else if (x >= 190 && x <= 290 && y >= 280 && y <= 314) {
     screen = SCR_SETTINGS; drawSettingsMenu();
   }
 }
@@ -1384,22 +1453,28 @@ const char* keypadTitle() {
   return "";
 }
 
+#define KP_TOP 82
+#define KP_ROW_STEP 52
+#define KP_KEY_W 143
+#define KP_KEY_GAP 15
+#define KP_KEY_H 44
+
 void drawKeypad() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
-  printCentered(keypadTitle(), 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
+  printCentered(keypadTitle(), CX, 5, 1, COLOR_INFO, COLOR_PANEL);
 
   int n = keypadDigits;
-  int boxW = 34, boxGap = 8;
-  int startX = 160 - (n * boxW + (n - 1) * boxGap) / 2;
+  int boxW = 40, boxGap = 10;
+  int startX = CX - (n * boxW + (n - 1) * boxGap) / 2;
   for (int i = 0; i < n; i++) {
     int bx = startX + i * (boxW + boxGap);
     bool filled = i < keypadBuffer.length();
-    tft.drawRoundRect(bx, 32, boxW, 28, 5, filled ? COLOR_ACCENT : COLOR_PANEL_EDGE);
+    tft.drawRoundRect(bx, 36, boxW, 34, 5, filled ? COLOR_ACCENT : COLOR_PANEL_EDGE);
     if (filled) {
       char c[2] = { keypadBuffer[i], 0 };
-      printCentered(c, bx + boxW / 2, 39, 2, COLOR_INFO, COLOR_BG);
+      printCentered(c, bx + boxW / 2, 45, 2, COLOR_INFO, COLOR_BG);
     }
   }
 
@@ -1407,19 +1482,19 @@ void drawKeypad() {
   int idx = 0;
   for (int row = 0; row < 4; row++) {
     for (int col = 0; col < 3; col++) {
-      int x = 10 + col * 105;
-      int y = 68 + row * 40;
+      int x = 10 + col * (KP_KEY_W + KP_KEY_GAP);
+      int y = KP_TOP + row * KP_ROW_STEP;
       uint16_t keyColor = COLOR_INFO;
       uint16_t borderColor = COLOR_PANEL_EDGE;
       if (keys[idx][0] == 'D') { keyColor = COLOR_DEL; borderColor = COLOR_DEL; }
 
       if (keys[idx][0] == 'O') {
-        tft.fillRoundRect(x, y, 95, 34, 8, COLOR_ACCENT);
-        printCentered(keys[idx], x + 47, y + 10, 2, COLOR_BG, COLOR_ACCENT);
+        tft.fillRoundRect(x, y, KP_KEY_W, KP_KEY_H, 8, COLOR_ACCENT);
+        printCentered(keys[idx], x + KP_KEY_W / 2, y + 14, 2, COLOR_BG, COLOR_ACCENT);
       } else {
-        tft.fillRoundRect(x, y, 95, 34, 8, COLOR_PANEL);
-        tft.drawRoundRect(x, y, 95, 34, 8, borderColor);
-        printCentered(keys[idx], x + 47, y + 10, 2, keyColor, COLOR_PANEL);
+        tft.fillRoundRect(x, y, KP_KEY_W, KP_KEY_H, 8, COLOR_PANEL);
+        tft.drawRoundRect(x, y, KP_KEY_W, KP_KEY_H, 8, borderColor);
+        printCentered(keys[idx], x + KP_KEY_W / 2, y + 14, 2, keyColor, COLOR_PANEL);
       }
       idx++;
     }
@@ -1427,9 +1502,9 @@ void drawKeypad() {
 }
 
 int keypadHit(int16_t x, int16_t y) {
-  if (y < 68 || y > 68 + 4 * 40) return -1;
-  int row = (y - 68) / 40;
-  int col = (x - 10) / 105;
+  if (y < KP_TOP || y > KP_TOP + 4 * KP_ROW_STEP) return -1;
+  int row = (y - KP_TOP) / KP_ROW_STEP;
+  int col = (x - 10) / (KP_KEY_W + KP_KEY_GAP);
   if (row < 0 || row > 3 || col < 0 || col > 2) return -1;
   return row * 3 + col;
 }
@@ -1527,10 +1602,10 @@ void startTextEntry(TextPurpose p, int maxLen, const String &initial) {
 }
 
 void drawTextField() {
-  tft.fillRect(0, 30, 320, 30, COLOR_BG);
-  tft.drawRoundRect(4, 32, 312, 26, 5, COLOR_PANEL_EDGE);
+  tft.fillRect(0, 30, SCR_W, 30, COLOR_BG);
+  tft.drawRoundRect(4, 32, SCR_W - 8, 26, 5, COLOR_PANEL_EDGE);
   String shown = textBuffer;
-  const int maxChars = 30; // roughly what fits at size-1 in the field width
+  const int maxChars = 44; // roughly what fits at size-1 in the wider field width
   if ((int)shown.length() > maxChars) {
     shown = shown.substring(shown.length() - maxChars); // scroll to show the tail
   }
@@ -1545,97 +1620,115 @@ const char* textRow0() { return (textMode == TXT_SYMBOLS) ? "1234567890" : (text
 const char* textRow1() { return (textMode == TXT_SYMBOLS) ? "!@#$%^&*(" : (textMode == TXT_UPPER ? "ASDFGHJKL" : "asdfghjkl"); }
 const char* textRow2() { return (textMode == TXT_SYMBOLS) ? ")_+=.,?"   : (textMode == TXT_UPPER ? "ZXCVBNM"   : "zxcvbnm"); }
 
+// Text keyboard layout: wider keys (480px canvas) and taller rows/keys
+// (320px canvas) than the CYD's original 320x240 keyboard.
+#define TXT_KB_TOP 70
+#define TXT_KB_ROW_STEP 52
+#define TXT_KB_KEY_H 46
+#define TXT_KB_W0 (SCR_W / 10)     // row 0: 10 keys, full width
+#define TXT_KB_W1 (SCR_W / 9)      // row 1: 9 keys, full width
+#define TXT_KB_W2 48               // row 2: middle keys
+#define TXT_KB_MODE_X 1
+#define TXT_KB_MODE_W 69
+#define TXT_KB_ROW2_X 72
+#define TXT_KB_DEL_X 410
+#define TXT_KB_DEL_W 69
+#define TXT_KB_SPACE_X 1
+#define TXT_KB_SPACE_W 372
+#define TXT_KB_OK_X 375
+#define TXT_KB_OK_W 104
+
 void drawTextPad() {
   tft.fillScreen(COLOR_BG);
-  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
-  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
+  tft.fillRect(0, 0, SCR_W, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, SCR_W, COLOR_ACCENT);
   printCentered(textPurpose == TXT_SSID ? "WI-FI NETWORK NAME" : "WI-FI PASSWORD",
-                160, 5, 1, COLOR_INFO, COLOR_PANEL);
+                CX, 5, 1, COLOR_INFO, COLOR_PANEL);
 
   drawTextField();
 
-  const int kbTop = 66, rowStep = 40, keyH = 34;
+  const int kbTop = TXT_KB_TOP, rowStep = TXT_KB_ROW_STEP, keyH = TXT_KB_KEY_H;
   const char* row0 = textRow0();
   const char* row1 = textRow1();
   const char* row2 = textRow2();
 
   // Row 0: 10 keys, full width
-  int w0 = 32;
+  int w0 = TXT_KB_W0;
   for (int i = 0; i < 10; i++) {
     char c[2] = { row0[i], 0 };
     int x = i * w0;
     tft.fillRoundRect(x + 1, kbTop, w0 - 2, keyH, 4, COLOR_PANEL);
     tft.drawRoundRect(x + 1, kbTop, w0 - 2, keyH, 4, COLOR_PANEL_EDGE);
-    printCentered(c, x + w0 / 2, kbTop + 9, 2, COLOR_INFO, COLOR_PANEL);
+    printCentered(c, x + w0 / 2, kbTop + 12, 2, COLOR_INFO, COLOR_PANEL);
   }
 
   // Row 1: 9 keys
   int y1 = kbTop + rowStep;
-  int w1 = 320 / 9;
+  int w1 = TXT_KB_W1;
   for (int i = 0; i < 9; i++) {
     char c[2] = { row1[i], 0 };
     int x = i * w1;
     tft.fillRoundRect(x + 1, y1, w1 - 2, keyH, 4, COLOR_PANEL);
     tft.drawRoundRect(x + 1, y1, w1 - 2, keyH, 4, COLOR_PANEL_EDGE);
-    printCentered(c, x + w1 / 2, y1 + 9, 2, COLOR_INFO, COLOR_PANEL);
+    printCentered(c, x + w1 / 2, y1 + 12, 2, COLOR_INFO, COLOR_PANEL);
   }
 
   // Row 2: MODE key + 7 keys + DEL
   int y2 = kbTop + 2 * rowStep;
   const char* modeLabel = (textMode == TXT_LOWER) ? "ABC" : (textMode == TXT_UPPER ? "123" : "abc");
-  tft.fillRoundRect(1, y2, 46, keyH, 4, COLOR_PANEL);
-  tft.drawRoundRect(1, y2, 46, keyH, 4, COLOR_ACCENT);
-  printCentered(modeLabel, 24, y2 + 9, 1, COLOR_ACCENT, COLOR_PANEL);
+  tft.fillRoundRect(TXT_KB_MODE_X, y2, TXT_KB_MODE_W, keyH, 4, COLOR_PANEL);
+  tft.drawRoundRect(TXT_KB_MODE_X, y2, TXT_KB_MODE_W, keyH, 4, COLOR_ACCENT);
+  printCentered(modeLabel, TXT_KB_MODE_X + TXT_KB_MODE_W / 2, y2 + 12, 1, COLOR_ACCENT, COLOR_PANEL);
 
-  int w2 = 32;
+  int w2 = TXT_KB_W2;
   for (int i = 0; i < 7; i++) {
     char c[2] = { row2[i], 0 };
-    int x = 48 + i * w2;
+    int x = TXT_KB_ROW2_X + i * w2;
     tft.fillRoundRect(x + 1, y2, w2 - 2, keyH, 4, COLOR_PANEL);
     tft.drawRoundRect(x + 1, y2, w2 - 2, keyH, 4, COLOR_PANEL_EDGE);
-    printCentered(c, x + w2 / 2, y2 + 9, 2, COLOR_INFO, COLOR_PANEL);
+    printCentered(c, x + w2 / 2, y2 + 12, 2, COLOR_INFO, COLOR_PANEL);
   }
 
-  tft.fillRoundRect(273, y2, 46, keyH, 4, COLOR_PANEL);
-  tft.drawRoundRect(273, y2, 46, keyH, 4, COLOR_DEL);
-  printCentered("DEL", 296, y2 + 9, 1, COLOR_DEL, COLOR_PANEL);
+  tft.fillRoundRect(TXT_KB_DEL_X, y2, TXT_KB_DEL_W, keyH, 4, COLOR_PANEL);
+  tft.drawRoundRect(TXT_KB_DEL_X, y2, TXT_KB_DEL_W, keyH, 4, COLOR_DEL);
+  printCentered("DEL", TXT_KB_DEL_X + TXT_KB_DEL_W / 2, y2 + 12, 1, COLOR_DEL, COLOR_PANEL);
 
   // Row 3: SPACE + OK
   int y3 = kbTop + 3 * rowStep;
-  tft.fillRoundRect(1, y3, 248, keyH, 4, COLOR_PANEL);
-  tft.drawRoundRect(1, y3, 248, keyH, 4, COLOR_PANEL_EDGE);
-  printCentered("SPACE", 125, y3 + 9, 1, COLOR_INFO, COLOR_PANEL);
+  tft.fillRoundRect(TXT_KB_SPACE_X, y3, TXT_KB_SPACE_W, keyH, 4, COLOR_PANEL);
+  tft.drawRoundRect(TXT_KB_SPACE_X, y3, TXT_KB_SPACE_W, keyH, 4, COLOR_PANEL_EDGE);
+  printCentered("SPACE", TXT_KB_SPACE_X + TXT_KB_SPACE_W / 2, y3 + 12, 1, COLOR_INFO, COLOR_PANEL);
 
-  tft.fillRoundRect(250, y3, 69, keyH, 4, COLOR_ACCENT);
-  printCentered("OK", 284, y3 + 9, 1, COLOR_BG, COLOR_ACCENT);
+  tft.fillRoundRect(TXT_KB_OK_X, y3, TXT_KB_OK_W, keyH, 4, COLOR_ACCENT);
+  printCentered("OK", TXT_KB_OK_X + TXT_KB_OK_W / 2, y3 + 12, 1, COLOR_BG, COLOR_ACCENT);
 }
 
 // Returns a key code: 0-9 (row 0), 100-108 (row 1), 200-206 (row 2 middle),
 // 300 (MODE), 301 (DEL), 302 (SPACE), 303 (OK), or -1 for no hit.
 int textPadHit(int16_t x, int16_t y) {
-  const int kbTop = 66, rowStep = 40;
+  const int kbTop = TXT_KB_TOP, rowStep = TXT_KB_ROW_STEP;
   if (y < kbTop || y > kbTop + 4 * rowStep) return -1;
   int row = (y - kbTop) / rowStep;
 
   if (row == 0) {
-    int col = x / 32;
+    int col = x / TXT_KB_W0;
     if (col < 0 || col > 9) return -1;
     return col;
   }
   if (row == 1) {
-    int col = x / (320 / 9);
+    int col = x / TXT_KB_W1;
     if (col < 0 || col > 8) return -1;
     return 100 + col;
   }
   if (row == 2) {
-    if (x < 48) return 300;
-    if (x >= 273) return 301;
-    int col = (x - 48) / 32;
+    if (x < TXT_KB_ROW2_X) return 300;
+    if (x >= TXT_KB_DEL_X) return 301;
+    int col = (x - TXT_KB_ROW2_X) / TXT_KB_W2;
     if (col < 0 || col > 6) return -1;
     return 200 + col;
   }
   if (row == 3) {
-    return (x < 250) ? 302 : 303;
+    return (x < TXT_KB_OK_X) ? 302 : 303;
   }
   return -1;
 }
@@ -1742,7 +1835,7 @@ void loop() {
 
   switch (screen) {
     case SCR_CLOCK:
-      if (pressed && x >= 286 && x <= 312 && y >= 2 && y <= 28) {
+      if (pressed && x >= GEAR_HIT_X0 && x <= GEAR_HIT_X1 && y >= GEAR_HIT_Y0 && y <= GEAR_HIT_Y1) {
         screen = SCR_SETTINGS;
         drawSettingsMenu();
         break;
