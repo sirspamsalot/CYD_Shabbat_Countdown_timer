@@ -1332,6 +1332,18 @@ void handleFirstRunButtons() {
 // Setup / Loop
 // =========================================================================
 void setup() {
+  // Diagnostic serial output — if the panel ever shows only a blank/stale
+  // screen after flashing, open the Serial Monitor at 115200 baud and see
+  // exactly which of these lines is the LAST one printed. That pinpoints
+  // whether it's hanging in display.init() (commonly a BUSY-pin timing/
+  // polarity mismatch — Elecrow's own wiki for this board notes there are
+  // two hardware/firmware revisions, v1.0 and v1.2, and recommends trying
+  // the other one if display initialization fails) versus something later
+  // (e.g. it inits fine but never reaches the first draw).
+  Serial.begin(115200);
+  delay(300); // give the USB-CDC serial port a moment to enumerate
+  Serial.println(F("[boot] starting setup()"));
+
   pinMode(BTN_MENU, INPUT_PULLUP);
   pinMode(BTN_EXIT, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
@@ -1340,12 +1352,22 @@ void setup() {
 
   pinMode(EPD_PWR, OUTPUT);
   digitalWrite(EPD_PWR, HIGH); // power up the panel's regulator before talking to it
+  delay(50); // let the panel's regulator settle before driving SPI/RST into it
+  Serial.println(F("[boot] EPD_PWR set HIGH, regulator should be up"));
 
   SPI.begin(EPD_SCLK, -1 /* MISO unused by the display */, EPD_MOSI, EPD_CS);
-  display.init(115200);
+  Serial.println(F("[boot] SPI.begin() done, calling display.init()..."));
+  // reset_duration=50 (vs. the library default's shorter pulse): a
+  // community-tested working setup for this exact panel uses a 50ms reset
+  // pulse. A too-short reset can leave the panel in a state where BUSY
+  // never clears, producing "Busy Timeout!" on the very first refresh —
+  // which is the exact symptom this was added to fix.
+  display.init(115200, true, 50, false);
+  Serial.println(F("[boot] display.init() returned — if you never saw this line, it hung waiting on the panel (BUSY pin most likely)"));
   display.setRotation(1); // landscape; try 0/2/3 if the image is sideways/mirrored on your unit
 
   loadSettings();
+  Serial.println(F("[boot] settings loaded, proceeding to first screen"));
 
   if (!setupDone) {
     // First boot: show the Wi-Fi vs. offline choice instead of jumping
@@ -1353,7 +1375,9 @@ void setup() {
     // neither is meaningful until the user has picked a path.
     firstRunActive = true;
     screen = SCR_FIRST_RUN;
+    Serial.println(F("[boot] calling drawFirstRunScreen()..."));
     drawFirstRunScreen();
+    Serial.println(F("[boot] drawFirstRunScreen() returned — a full panel refresh should have just happened. If the screen still looks unchanged, the refresh itself (fullRefreshGeneric's firstPage/nextPage loop) is where it's stuck or silently failing."));
     return;
   }
 
