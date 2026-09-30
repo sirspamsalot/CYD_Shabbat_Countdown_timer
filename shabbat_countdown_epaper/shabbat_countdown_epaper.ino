@@ -1363,11 +1363,12 @@ void setup() {
   // Diagnostic serial output — if the panel ever shows only a blank/stale
   // screen after flashing, open the Serial Monitor at 115200 baud and see
   // exactly which of these lines is the LAST one printed. That pinpoints
-  // whether it's hanging in display.init() (commonly a BUSY-pin timing/
-  // polarity mismatch — Elecrow's own wiki for this board notes there are
-  // two hardware/firmware revisions, v1.0 and v1.2, and recommends trying
-  // the other one if display initialization fails) versus something later
-  // (e.g. it inits fine but never reaches the first draw).
+  // whether it's hanging in display.init() versus something later (e.g. it
+  // inits fine but never reaches the first draw). On this board the panel
+  // itself is confirmed working (it ran a demo cycling through several
+  // screens before this sketch was flashed), so a stuck/unresponsive panel
+  // after flashing points at this firmware's own init sequence inheriting
+  // a bad state from whatever ran before it, not a hardware fault.
   Serial.begin(115200);
   delay(300); // give the USB-CDC serial port a moment to enumerate
   Serial.println(F("[boot] starting setup()"));
@@ -1379,13 +1380,20 @@ void setup() {
   pinMode(BTN_OK, INPUT_PULLUP);
 
   pinMode(EPD_PWR, OUTPUT);
-  digitalWrite(EPD_PWR, HIGH); // power up the panel's regulator before talking to it
-  delay(200); // let the panel's regulator settle before driving SPI/RST into it —
-              // widened from 50ms to 200ms since BUSY being stuck HIGH forever
-              // on one unit raised the question of whether the regulator was
-              // fully up before RST/SPI started; cheap to try, costs nothing
-              // at boot either way
-  Serial.println(F("[boot] EPD_PWR set HIGH, regulator should be up"));
+  // Force a REAL power cycle rather than just asserting HIGH. If EPD_PWR was
+  // already HIGH when this firmware started (e.g. the panel was mid-refresh
+  // under a previous/demo firmware when the board got reflashed), a bare
+  // digitalWrite(HIGH) is a no-op and the panel's regulator never actually
+  // resets — it just stays in whatever state the old firmware left it in.
+  // Confirmed known-working demo firmware on this exact unit drove the
+  // panel through multiple screens fine, so the panel/cable are not the
+  // problem; this targets "our firmware inherited a stuck panel state from
+  // the previous firmware" instead.
+  digitalWrite(EPD_PWR, LOW);
+  delay(200); // hold power off long enough for the regulator to fully discharge
+  digitalWrite(EPD_PWR, HIGH); // now a genuine off->on transition
+  delay(200); // let the panel's regulator settle before driving SPI/RST into it
+  Serial.println(F("[boot] EPD_PWR power-cycled (LOW then HIGH), regulator should be up"));
 
   SPI.begin(EPD_SCLK, -1 /* MISO unused by the display */, EPD_MOSI, EPD_CS);
 
