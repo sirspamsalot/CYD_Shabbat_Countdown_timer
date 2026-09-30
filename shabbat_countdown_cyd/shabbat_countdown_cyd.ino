@@ -93,7 +93,7 @@
 // immediately after the last #include — before any type defined later in
 // this file would otherwise be visible. Several functions take these enums
 // as parameters, so they have to exist before that insertion point.
-enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_KEYPAD, SCR_BRIGHTNESS, SCR_TEXTPAD, SCR_CITY_LIST, SCR_FIRST_RUN };
+enum AppScreen { SCR_CLOCK, SCR_SETTINGS, SCR_KEYPAD, SCR_BRIGHTNESS, SCR_TEXTPAD, SCR_CITY_LIST, SCR_FIRST_RUN, SCR_CONFIRM_RESET };
 enum KeypadPurpose { KP_ZIP, KP_HAVDALAH, KP_YEAR, KP_MONTH, KP_DAY, KP_HOUR, KP_MINUTE };
 // Alphanumeric text entry (Wi-Fi SSID/password) is a separate keyboard
 // screen from the numeric keypad above, since it needs letters and symbols.
@@ -464,6 +464,36 @@ bool geocodeZip(const String &zip) {
   return true;
 }
 
+// ---------------- IP-based timezone lookup (Wi-Fi only, no lat/lon needed) ----------------
+// Once Wi-Fi is connected we already have a public IP, and that alone is
+// enough to look up the real timezone (DST included) — no ZIP/city/lat/lon
+// needed at all. This is why it's called right after every successful NTP
+// sync, even before a location has been picked. It replaces relying on the
+// crude longitude/15 estimate below for anyone who ever connects to Wi-Fi:
+// that estimate ignores DST and real timezone/political boundaries, which
+// rarely line up with 15-degree longitude bands. If this lookup fails
+// (network hiccup, DNS issue, unexpected response), hasUtcOffset is simply
+// left false and the longitude fallback still kicks in as before.
+bool fetchTimezoneFromIP() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin("http://worldtimeapi.org/api/ip");
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, payload)) return false;
+  if (!doc.containsKey("raw_offset") || !doc.containsKey("dst_offset")) return false;
+
+  long rawOffset = doc["raw_offset"].as<long>();
+  long dstOffset = doc["dst_offset"].as<long>();
+  localUtcOffsetSeconds = rawOffset + dstOffset;
+  saveUtcOffset();
+  return true;
+}
+
 void doGeocode() {
   tft.fillRect(0, 30, 320, 190, COLOR_BG);
   printCentered("LOCATING...", 160, 105, 2, COLOR_ACCENT_DIM, COLOR_BG);
@@ -643,6 +673,7 @@ void saveWifiCreds(const String &ssid, const String &pass) {
   hasWallClock = attemptNtpSync(15000, 8000, true);
   lastNtpAttemptMs = millis();
   if (hasWallClock) {
+    fetchTimezoneFromIP();
     if (!hasCoords) needsGeocode = true;
     else if (!hasUtcOffset) {
       localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600;
@@ -986,8 +1017,9 @@ void updateCountdown() {
 
 // =========================================================================
 // Screen: first-run setup choice — shown once, before setupDone is true.
-// Offers the existing Wi-Fi flow (auto time + auto location) or a fully
-// offline path (manual SET TIME + pick-a-city, no network ever required).
+// Offers the existing Wi-Fi flow (auto time via NTP; location is set
+// separately in Settings, or defaults to Las Vegas) or a fully offline
+// path (manual SET TIME + pick-a-city, no network ever required).
 // =========================================================================
 void drawFirstRunScreen() {
   tft.fillScreen(COLOR_BG);
@@ -998,7 +1030,7 @@ void drawFirstRunScreen() {
   tft.fillRoundRect(20, 50, 280, 80, 10, COLOR_PANEL);
   tft.drawRoundRect(20, 50, 280, 80, 10, COLOR_PANEL_EDGE);
   printCentered("CONNECT TO WI-FI", 160, 75, 2, COLOR_INFO, COLOR_PANEL);
-  printCentered("auto time + auto location", 160, 105, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
+  printCentered("auto time - set location after", 160, 105, 1, COLOR_ACCENT_DIM, COLOR_PANEL);
 
   tft.fillRoundRect(20, 145, 280, 80, 10, COLOR_PANEL);
   tft.drawRoundRect(20, 145, 280, 80, 10, COLOR_ACCENT);
@@ -1093,34 +1125,37 @@ void drawSettingsMenu() {
   // ZIP CODE and CITY render as two half-width buttons side by side in one
   // row — a visual cue that they're alternatives, not two separate settings
   // — which frees up vertical space for the remaining rows to breathe.
-  const int rowH = 28, rowStep = 34, top = 30;
+  // rowH/rowStep are trimmed slightly from their original 28/34 so the new
+  // SYSTEM RESET row still fits under the 240px screen height.
+  const int rowH = 26, rowStep = 30, top = 29;
 
   tft.fillRoundRect(20, top, 135, rowH, 7, COLOR_PANEL);
   tft.drawRoundRect(20, top, 135, rowH, 7, COLOR_PANEL_EDGE);
-  printCentered("ZIP CODE", 87, top + 8, 1, COLOR_INFO, COLOR_PANEL);
+  printCentered("ZIP CODE", 87, top + 7, 1, COLOR_INFO, COLOR_PANEL);
   tft.fillRoundRect(165, top, 135, rowH, 7, COLOR_PANEL);
   tft.drawRoundRect(165, top, 135, rowH, 7, COLOR_PANEL_EDGE);
-  printCentered("CITY", 232, top + 8, 1, COLOR_INFO, COLOR_PANEL);
+  printCentered("CITY", 232, top + 7, 1, COLOR_INFO, COLOR_PANEL);
 
-  const char* labels[5] = { "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "BACK" };
-  for (int i = 0; i < 5; i++) {
+  const char* labels[6] = { "WI-FI", "BRIGHTNESS", "SET TIME", "HAVDALAH OFFSET", "SYSTEM RESET", "BACK" };
+  for (int i = 0; i < 6; i++) {
     int y = top + (i + 1) * rowStep;
-    bool isBack = (i == 4);
+    bool isBack = (i == 5);
+    bool isReset = (i == 4);
     tft.fillRoundRect(20, y, 280, rowH, 7, COLOR_PANEL);
-    tft.drawRoundRect(20, y, 280, rowH, 7, isBack ? COLOR_ACCENT : COLOR_PANEL_EDGE);
-    printCentered(labels[i], 160, y + 7, 2, isBack ? COLOR_ACCENT : COLOR_INFO, COLOR_PANEL);
+    tft.drawRoundRect(20, y, 280, rowH, 7, isBack ? COLOR_ACCENT : (isReset ? COLOR_DEL : COLOR_PANEL_EDGE));
+    printCentered(labels[i], 160, y + 6, 2, isBack ? COLOR_ACCENT : (isReset ? COLOR_DEL : COLOR_INFO), COLOR_PANEL);
   }
 }
 
 int settingsMenuHit(int16_t x, int16_t y) {
-  const int rowH = 28, rowStep = 34, top = 30;
+  const int rowH = 26, rowStep = 30, top = 29;
   if (y >= top && y <= top + rowH) {
     if (x >= 20 && x < 155) return 0;   // ZIP CODE (left half)
     if (x >= 165 && x <= 300) return 1; // CITY (right half)
     return -1;
   }
   if (x < 20 || x > 300) return -1;
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 6; i++) {
     int ry = top + (i + 1) * rowStep;
     if (y >= ry && y <= ry + rowH) return i + 2;
   }
@@ -1145,7 +1180,77 @@ void handleSettingsTouch(int16_t x, int16_t y) {
     case 3: screen = SCR_BRIGHTNESS; drawBrightnessScreen(); break;
     case 4: startKeypad(KP_YEAR, 4); break;
     case 5: startKeypad(KP_HAVDALAH, 3); break;
-    case 6: screen = SCR_CLOCK; drawStaticUI(); break;
+    case 6: screen = SCR_CONFIRM_RESET; drawConfirmResetScreen(); break;
+    case 7: screen = SCR_CLOCK; drawStaticUI(); break;
+  }
+}
+
+// =========================================================================
+// Screen: SYSTEM RESET confirmation — reachable from Settings. Wipes every
+// persisted key (Wi-Fi creds, location, time offset, havdalah offset, etc.)
+// and drops the device back into the SCR_FIRST_RUN flow, same as a fresh
+// unconfigured boot.
+// =========================================================================
+void drawConfirmResetScreen() {
+  tft.fillScreen(COLOR_BG);
+  tft.fillRect(0, 0, 320, 26, COLOR_PANEL);
+  tft.drawFastHLine(0, 26, 320, COLOR_ACCENT);
+  printCentered("SYSTEM RESET", 160, 5, 1, COLOR_INFO, COLOR_PANEL);
+
+  printCentered("ARE YOU SURE?", 160, 45, 2, COLOR_ACCENT, COLOR_BG);
+  printCentered("erases wifi, location, time", 160, 78, 1, COLOR_ACCENT_DIM, COLOR_BG);
+  printCentered("and all settings", 160, 94, 1, COLOR_ACCENT_DIM, COLOR_BG);
+
+  tft.fillRoundRect(20, 145, 130, 70, 10, COLOR_PANEL);
+  tft.drawRoundRect(20, 145, 130, 70, 10, COLOR_DEL);
+  printCentered("YES, RESET", 85, 172, 1, COLOR_DEL, COLOR_PANEL);
+
+  tft.fillRoundRect(170, 145, 130, 70, 10, COLOR_PANEL);
+  tft.drawRoundRect(170, 145, 130, 70, 10, COLOR_ACCENT);
+  printCentered("CANCEL", 235, 172, 1, COLOR_ACCENT, COLOR_PANEL);
+}
+
+// Wipes the entire "shabbat" Preferences namespace, resets in-RAM state to
+// just-booted defaults (mirroring what loadSettings() would load from an
+// empty namespace), and re-enters SCR_FIRST_RUN — the same state a brand
+// new, never-configured device would be in.
+void performSystemReset() {
+  prefs.begin("shabbat", false);
+  prefs.clear();
+  prefs.end();
+
+  currentZip = DEFAULT_ZIP;
+  latitude = 0.0;
+  longitude = 0.0;
+  hasCoords = false;
+  havdalahOffsetMin = DEFAULT_HAVDALAH_OFFSET_MIN;
+  brightnessPct = DEFAULT_BRIGHTNESS_PCT;
+  localUtcOffsetSeconds = 0;
+  hasUtcOffset = false;
+  currentSsid = "";
+  currentPass = "";
+  hasWifiCreds = false;
+  usingCity = false;
+  currentCityLabel = "";
+  setupDone = false;
+  candleLightingEpoch = 0;
+  havdalahEpoch = 0;
+  hasWallClock = false;
+  needsGeocode = false;
+  screenNeedsFullRedraw = true;
+  applyBrightness();
+
+  firstRunActive = true;
+  screen = SCR_FIRST_RUN;
+  drawFirstRunScreen();
+}
+
+void handleConfirmResetTouch(int16_t x, int16_t y) {
+  if (y < 145 || y > 215) return;
+  if (x >= 20 && x <= 150) {
+    performSystemReset();
+  } else if (x >= 170 && x <= 300) {
+    screen = SCR_SETTINGS; drawSettingsMenu();
   }
 }
 
@@ -1539,6 +1644,7 @@ void setup() {
   lastNtpAttemptMs = millis();
 
   if (hasWallClock) {
+    fetchTimezoneFromIP();
     if (!hasCoords) {
       needsGeocode = true;
     } else if (!hasUtcOffset) {
@@ -1575,6 +1681,7 @@ void loop() {
           bool hadWallClock = hasWallClock;
           if (attemptNtpSync(6000, 5000, false)) {
             hasWallClock = true;
+            fetchTimezoneFromIP();
             if (!hadWallClock) {
               // First time we've ever gotten a real clock this boot —
               // kick off whatever was waiting on it.
@@ -1627,6 +1734,10 @@ void loop() {
 
     case SCR_FIRST_RUN:
       if (pressed) handleFirstRunTouch(x, y);
+      break;
+
+    case SCR_CONFIRM_RESET:
+      if (pressed) handleConfirmResetTouch(x, y);
       break;
   }
 }
