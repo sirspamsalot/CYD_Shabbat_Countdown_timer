@@ -22,9 +22,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v5 # v5+ targets Node 24 natively, clearing that deprecation warning
 
       - name: Install arduino-cli
+        # No newer major of this action exists yet (still v2, last bumped to
+        # Node 20) — GitHub's "forced to run on Node 24" warning for this one
+        # is just its compatibility shim kicking in, and is harmless; there's
+        # nothing to pin to until arduino/setup-arduino-cli ships a Node
+        # 24-targeting release.
         uses: arduino/setup-arduino-cli@v2
 
       - name: Install ESP32 core
@@ -32,7 +37,13 @@ jobs:
           arduino-cli config init --overwrite
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          # Pinned, not "latest": the ESP32 Arduino core's 3.x line changed
+          # the LEDC (PWM backlight) API this sketch uses — ledcSetup()/
+          # ledcAttachPin() were replaced by ledcAttach(). 2.0.17 is the
+          # version this project was originally built and confirmed working
+          # against; bump deliberately (and update the ledc calls in the
+          # .ino to match) rather than silently picking up a newer major.
+          arduino-cli core install esp32:esp32@2.0.17
 
       - name: Install libraries
         run: |
@@ -47,6 +58,7 @@ jobs:
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
             --export-binaries \
+            -v \
             shabbat_countdown_cyd
 
       - name: Collect firmware binaries for the web flasher
