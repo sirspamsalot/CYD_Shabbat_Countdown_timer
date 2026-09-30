@@ -43,21 +43,16 @@
   CYD's original hardcoded 320x240 coordinates, based on real-hardware
   feedback that the first pass only drew into the top-left 320x240 corner.
 
-  IMPORTANT — TOUCH STILL LIKELY NEEDS CALIBRATION: real hardware also
-  reported touch tracking incorrectly. Two independent things can cause
-  that, and this pass fixes only the first automatically:
-    - The touch->pixel mapping now targets the full 0-479 / 0-319 range
-      (it previously only mapped onto the old 320x240 sub-region, which
-      alone would have made anything outside that corner untouchable).
-    - The four raw-ADC calibration numbers (TS_MINX/MAXX/MINY/MAXY) and
-      the axis order/direction are still UNVERIFIED guesses carried over
-      from the CYD's different, dedicated-bus touch digitizer. TOUCH_DEBUG
-      is on (prints raw ADC coordinates in the bottom-left corner on every
-      tap) and three new toggles — TOUCH_SWAP_XY / TOUCH_INVERT_X /
-      TOUCH_INVERT_Y, near the touch driver code — let you try axis
-      swaps/flips without hunting through the code, before re-deriving the
-      four calibration numbers from the raw values TOUCH_DEBUG prints. See
-      the README's Touch calibration section for the step-by-step process.
+  UPDATE — touch is now calibrated from all four real corner taps. With
+  TOUCH_DEBUG on, all four corners showed both axes reading backwards
+  relative to the screen (largest raw X on the LEFT, largest raw Y at the
+  TOP) rather than transposed — so TOUCH_INVERT_X and TOUCH_INVERT_Y are
+  both set to 1, TOUCH_SWAP_XY stays 0, and TS_MINX/MAXX/MINY/MAXY near the
+  touch driver code bracket the actual readings from all four corners (not
+  guesses), with a little headroom. TOUCH_DEBUG itself is back off (0) for
+  normal use — flip it to 1 again if touch ever needs re-checking on a
+  different unit; see the README's Touch calibration section for the
+  step-by-step process.
 
   Display style: big seven-segment-style digits on black, in the spirit of
   the countdown clock from "Studio 60 on the Sunset Strip"'s title
@@ -284,10 +279,16 @@ String pendingSsid = ""; // holds the SSID between the SSID and password steps
 // corner on every tap — tap the four corners of the screen, note the raw
 // numbers, and adjust TS_MINX/MAXX/MINY/MAXY until they bracket what you
 // see (min at the top-left-most reading, max at the bottom-right-most).
-#define TS_MINX 200
-#define TS_MAXX 3700
-#define TS_MINY 240
-#define TS_MAXY 3800
+// Calibrated from all four real corner taps: top-left (3892,3729),
+// top-right (296,3818), bottom-right (299,313), bottom-left (3910,250). X
+// runs opposite to screen-X (large raw on the LEFT), Y runs opposite to
+// screen-Y (large raw at the TOP) — see TOUCH_INVERT_X/Y below. All four
+// numbers below now bracket the actual readings from all four corners
+// (with a little headroom), not guesses.
+#define TS_MINX 280
+#define TS_MAXX 3930
+#define TS_MINY 230
+#define TS_MAXY 3840
 
 // If taps land in a plausible-but-wrong spot after the four numbers above
 // are dialed in — e.g. dragging left-to-right moves the cursor up-and-down
@@ -298,16 +299,19 @@ String pendingSsid = ""; // holds the SSID between the SSID and password steps
 // this wiring hasn't been verified against real hardware. Try toggling
 // these one at a time (reflash after each change) before re-deriving the
 // four calibration numbers above:
+// Confirmed from the two top-edge taps above: X reads backwards (large raw
+// on screen-left) and the top edge's raw Y sits near TS_MAXY, i.e. Y also
+// reads backwards. No evidence of a swap (each axis tracked its own screen
+// direction, just flipped) — SWAP stays off.
 #define TOUCH_SWAP_XY   0   // 1 = swap X and Y before mapping (try this first if axes feel transposed)
-#define TOUCH_INVERT_X  0   // 1 = flip left/right
-#define TOUCH_INVERT_Y  0   // 1 = flip up/down
+#define TOUCH_INVERT_X  1   // 1 = flip left/right
+#define TOUCH_INVERT_Y  1   // 1 = flip up/down
 
 // Set to 1 to print raw touch ADC coordinates in the corner of the screen
-// on every tap, for recalibrating the constants above. Leave at 0 for
-// normal use. TEMPORARILY SET TO 1 for calibrating this board — see the
-// README's Touch calibration section for how to use it, then set back to
-// 0 once TS_MINX/MAXX/MINY/MAXY above are updated with your real values.
-#define TOUCH_DEBUG 1
+// on every tap, for recalibrating the constants above. Calibration is now
+// done (see the real values above), so this is back to 0 for normal use —
+// flip it to 1 again if touch ever needs re-checking on a different unit.
+#define TOUCH_DEBUG 0
 
 bool touchInit() {
   // Shares tftSPI with the display (see the pin note near the top of this
