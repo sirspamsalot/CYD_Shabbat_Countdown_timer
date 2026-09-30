@@ -702,7 +702,7 @@ void countdownStrings(String &lineTop, String &lineBottom) {
 }
 
 void drawCountdownArea() {
-  printCentered("TIME REMAINING", 200, 42, 3, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("TIME REMAINING", 200, 41, 3, GxEPD_BLACK, GxEPD_WHITE);
 
   const int fx0 = 40, fy0 = 74, fx1 = 360, fy1 = 170;
   display.drawRoundRect(fx0, fy0, fx1 - fx0, fy1 - fy0, 8, GxEPD_BLACK);
