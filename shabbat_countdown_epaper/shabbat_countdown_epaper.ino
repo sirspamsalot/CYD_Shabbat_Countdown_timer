@@ -1408,10 +1408,20 @@ void setup() {
   pinMode(EPD_RST, OUTPUT);
   pinMode(EPD_BUSY, INPUT);
   Serial.print(F("[diag] EPD_BUSY before reset: ")); Serial.println(digitalRead(EPD_BUSY));
-  digitalWrite(EPD_RST, LOW);
-  delay(200); // widened from 20ms to 200ms — a longer hard-reset pulse, in case
-              // a too-short pulse was leaving the panel in a half-reset state
+  // Reset sequence copied EXACTLY from Elecrow's own official demo firmware
+  // for this board (EPD_RESET() in their EPD.cpp, from their GitHub repo
+  // Elecrow-RD/ESP32_S3-Ink-Screen). Their version explicitly asserts RST
+  // HIGH first and lets it settle for 100ms BEFORE pulsing LOW — our
+  // previous diagnostic pulsed straight to LOW with no prior HIGH settle,
+  // which may not register as a clean reset edge if the pin's power-up
+  // state was ambiguous. This is their exact HIGH(100ms)/LOW(10ms)/HIGH(10ms)
+  // timing, not a guess.
   digitalWrite(EPD_RST, HIGH);
+  delay(100);
+  digitalWrite(EPD_RST, LOW);
+  delay(10);
+  digitalWrite(EPD_RST, HIGH);
+  delay(10);
   Serial.println(F("[diag] watching EPD_BUSY for 2s after a manual reset pulse (only level CHANGES are printed):"));
   {
     unsigned long diagStart = millis();
