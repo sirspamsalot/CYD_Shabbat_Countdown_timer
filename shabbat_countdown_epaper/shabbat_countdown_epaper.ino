@@ -52,20 +52,38 @@
                      step). If your unit's rotary knob instead needs true
                      quadrature decoding to feel right (missed/doubled
                      steps when turning), that's the thing to revisit.
-    Library:        GxEPD2 (by Jean-Marc Zingg), display class
-                     GxEPD2_420_GDEY042T81 (src/gdey/ subfolder), used in
-                     full-buffer mode (8MB PSRAM makes this easy — no
-                     manual paging needed). An earlier version of this
-                     sketch referenced GxEPD2_420_GYE042A87, which several
-                     third-party CrowPanel write-ups cite but which was
-                     never actually merged into the GxEPD2 library (it was
-                     only discussed/donated on the GxEPD2 forum, never
-                     shipped) — that name doesn't exist in any released
-                     GxEPD2 version and fails to compile
-                     ("fatal error: ... No such file or directory").
-                     GDEY042T81 is the SSD1683/400x300 4.2" driver that IS
-                     actually in the library, confirmed present at
-                     src/gdey/GxEPD2_420_GDEY042T81.h as of GxEPD2 1.6.9.
+    Library:        GxEPD2 (by Jean-Marc Zingg) provides the base classes
+                     this sketch builds on (GxEPD2_BW, GxEPD2_EPD, Adafruit
+                     GFX glue, etc). The actual panel driver class used
+                     here, GxEPD2_420_GDEY042T81_LB, is NOT the library's
+                     own copy — it's a vendored copy that ships alongside
+                     this .ino (GxEPD2_420_GDEY042T81_LB.h/.cpp in this
+                     same folder). Why:
+                       1. An earlier version of this sketch referenced
+                          GxEPD2_420_GYE042A87, which several third-party
+                          CrowPanel write-ups cite but which was never
+                          actually merged into the GxEPD2 library (only
+                          discussed/donated on the GxEPD2 forum, never
+                          shipped) — fails to compile ("fatal error: ...
+                          No such file or directory"). Fixed by switching
+                          to GxEPD2_420_GDEY042T81, the real SSD1683/
+                          400x300 4.2" driver actually in the library
+                          (src/gdey/GxEPD2_420_GDEY042T81.h, GxEPD2 1.6.9).
+                       2. On real hardware, that driver's normal (library)
+                          copy consistently hit "Busy Timeout!" — the
+                          BUSY pin was observed (via a manual diagnostic)
+                          to go HIGH once after reset and never return LOW,
+                          which is the opposite of what the library's
+                          GxEPD2_EPD base class expects for this panel
+                          (busy_level hardcoded to HIGH in the real
+                          library's .cpp). The vendored copy here is a
+                          byte-for-byte copy of the real class with that
+                          one constant flipped to LOW. If your panel turns
+                          out to have normal (non-inverted) BUSY polarity,
+                          switch back to the plain #include <gdey/
+                          GxEPD2_420_GDEY042T81.h> / GxEPD2_420_GDEY042T81
+                          class instead — see GxEPD2_420_GDEY042T81_LB.h's
+                          header comment for the full story.
 
   IMPORTANT — hardware assumptions flagged for on-device verification,
   same spirit as the CYD sketch's notes: I could not compile-test this
@@ -76,16 +94,12 @@
       below.
     - Screen rotation: display.setRotation(1) is a starting guess for
       landscape. Try 0/2/3 if the image is sideways or mirrored.
-    - GxEPD2_420_GDEY042T81 should be the correct driver for this panel
-      (SSD1683, 400x300) — if your installed GxEPD2 version names it
-      slightly differently, or the image looks wrong (inverted, ghosting,
-      wrong wavetable), check the library's
-      examples/GxEPD2_Example/GxEPD2_display_selection_new_style.h for the
-      current closest 400x300 SSD1683 entry; GDEY042T81 and GYE042A87 are
-      reportedly near-identical SSD1683 panels that can behave slightly
-      differently under some lighting per community reports, so this is
-      the one thing about this board most worth confirming on real
-      hardware.
+    - BUSY pin polarity: this sketch currently assumes INVERTED polarity
+      (LOW = busy) based on a real-hardware diagnostic showing BUSY parked
+      HIGH indefinitely after reset. If timeouts persist even with the
+      vendored LOW-polarity driver, the BUSY pin/wiring itself (not just
+      polarity) is the more likely culprit — double check EPD_BUSY=48
+      against your actual board.
 
   BEFORE YOU FLASH:
   1. No Wi-Fi credentials to set here at all — flash as-is, then from the
@@ -107,7 +121,7 @@
 #include <DNSServer.h>
 #include <SPI.h>
 #include <GxEPD2_BW.h>
-#include <gdey/GxEPD2_420_GDEY042T81.h>
+#include "GxEPD2_420_GDEY042T81_LB.h" // vendored copy w/ inverted BUSY polarity fix — see that file's header comment
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
@@ -148,8 +162,8 @@ const int DEFAULT_HAVDALAH_OFFSET_MIN = 42;  // "3 medium stars" — adjustable 
 #define BTN_ACTIVE_LOW 1   // flip to 0 if your unit reads the opposite way
 // ------------------------------------------------
 
-GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(
-  GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
+GxEPD2_BW<GxEPD2_420_GDEY042T81_LB, GxEPD2_420_GDEY042T81_LB::HEIGHT> display(
+  GxEPD2_420_GDEY042T81_LB(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
 Preferences prefs;
