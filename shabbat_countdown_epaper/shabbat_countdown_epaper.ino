@@ -52,38 +52,39 @@
                      step). If your unit's rotary knob instead needs true
                      quadrature decoding to feel right (missed/doubled
                      steps when turning), that's the thing to revisit.
-    Library:        GxEPD2 (by Jean-Marc Zingg) provides the base classes
-                     this sketch builds on (GxEPD2_BW, GxEPD2_EPD, Adafruit
-                     GFX glue, etc). The actual panel driver class used
-                     here, GxEPD2_420_GDEY042T81_LB, is NOT the library's
-                     own copy — it's a vendored copy that ships alongside
-                     this .ino (GxEPD2_420_GDEY042T81_LB.h/.cpp in this
-                     same folder). Why:
-                       1. An earlier version of this sketch referenced
-                          GxEPD2_420_GYE042A87, which several third-party
-                          CrowPanel write-ups cite but which was never
-                          actually merged into the GxEPD2 library (only
-                          discussed/donated on the GxEPD2 forum, never
-                          shipped) — fails to compile ("fatal error: ...
-                          No such file or directory"). Fixed by switching
-                          to GxEPD2_420_GDEY042T81, the real SSD1683/
-                          400x300 4.2" driver actually in the library
-                          (src/gdey/GxEPD2_420_GDEY042T81.h, GxEPD2 1.6.9).
-                       2. On real hardware, that driver's normal (library)
-                          copy consistently hit "Busy Timeout!" — the
-                          BUSY pin was observed (via a manual diagnostic)
-                          to go HIGH once after reset and never return LOW,
-                          which is the opposite of what the library's
-                          GxEPD2_EPD base class expects for this panel
-                          (busy_level hardcoded to HIGH in the real
-                          library's .cpp). The vendored copy here is a
-                          byte-for-byte copy of the real class with that
-                          one constant flipped to LOW. If your panel turns
-                          out to have normal (non-inverted) BUSY polarity,
-                          switch back to the plain #include <gdey/
-                          GxEPD2_420_GDEY042T81.h> / GxEPD2_420_GDEY042T81
-                          class instead — see GxEPD2_420_GDEY042T81_LB.h's
-                          header comment for the full story.
+    Library:        GxEPD2 (by Jean-Marc Zingg), display class
+                     GxEPD2_420_GDEY042T81 (src/gdey/ subfolder). An earlier
+                     version of this sketch referenced GxEPD2_420_GYE042A87,
+                     which several third-party CrowPanel write-ups
+                     (including Elecrow's own wiki text) cite but which was
+                     never actually merged into the GxEPD2 library (only
+                     discussed/donated on the GxEPD2 forum, never shipped)
+                     — fails to compile ("fatal error: ... No such file or
+                     directory"). GDEY042T81 is the SSD1683/400x300 4.2"
+                     driver that IS actually in the library, and it's also
+                     what the manufacturer's own reference write-up
+                     (mischianti.org's CrowPanel ESP32-S3 4.2" article,
+                     which mirrors Elecrow's example) uses in practice —
+                     same pins (CS=45 DC=46 RST=47 BUSY=48 PWR=7,
+                     SCLK=12 MOSI=11, all confirmed against that reference)
+                     and the same display.init(115200, true, 50, false)
+                     call already used below. That reference also documents
+                     BUSY as HIGH=busy / LOW=ready, i.e. the GxEPD2 library's
+                     own default — so this sketch deliberately does NOT
+                     invert BUSY polarity, even though on one real unit
+                     BUSY was observed (via a manual diagnostic) parked HIGH
+                     indefinitely after reset and every refresh call timed
+                     out ("Busy Timeout!"). An earlier attempt inverted the
+                     polarity to make the timeout go away, but that only
+                     masked the symptom: it made _waitWhileBusy() return
+                     almost instantly (microseconds, not the ~1.2s a real
+                     refresh takes) without ever actually waiting for the
+                     panel, and the screen never updated. Since the pin
+                     mapping and init call both match the manufacturer's own
+                     known-working example, a BUSY pin stuck HIGH forever
+                     now looks like a hardware-level symptom (panel/cable/
+                     power), not a software one — see the troubleshooting
+                     note further down.
 
   IMPORTANT — hardware assumptions flagged for on-device verification,
   same spirit as the CYD sketch's notes: I could not compile-test this
@@ -92,6 +93,19 @@
     - Button polarity: assumed active-LOW with internal pull-ups. If
       presses register backwards (or never register), flip BTN_ACTIVE_LOW
       below.
+    - BUSY pin stuck HIGH / "Busy Timeout!" / screen never updates: pins
+      and init call are confirmed to match the manufacturer's own
+      reference example (see Library note above), so if this still
+      happens, it points at the physical panel connection rather than
+      code — things worth checking on the actual unit: (1) the e-paper
+      panel's FPC ribbon cable fully seated and the connector's latch
+      fully closed (a half-seated cable is the single most common cause
+      of "everything looks right in software but nothing happens on the
+      panel"); (2) try a noticeably longer EPD_PWR settle delay (the
+      `delay(50)` after EPD_PWR goes HIGH, below) in case the panel's
+      internal boost regulator needs more time under this particular
+      unit/cable's load; (3) if neither helps, this may be a defective
+      panel/connector and worth raising with Elecrow support.
     - Screen rotation: display.setRotation(1) is a starting guess for
       landscape. Try 0/2/3 if the image is sideways or mirrored.
     - BUSY pin polarity: this sketch currently assumes INVERTED polarity
@@ -121,7 +135,7 @@
 #include <DNSServer.h>
 #include <SPI.h>
 #include <GxEPD2_BW.h>
-#include "GxEPD2_420_GDEY042T81_LB.h" // vendored copy w/ inverted BUSY polarity fix — see that file's header comment
+#include <gdey/GxEPD2_420_GDEY042T81.h>
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
@@ -162,8 +176,8 @@ const int DEFAULT_HAVDALAH_OFFSET_MIN = 42;  // "3 medium stars" — adjustable 
 #define BTN_ACTIVE_LOW 1   // flip to 0 if your unit reads the opposite way
 // ------------------------------------------------
 
-GxEPD2_BW<GxEPD2_420_GDEY042T81_LB, GxEPD2_420_GDEY042T81_LB::HEIGHT> display(
-  GxEPD2_420_GDEY042T81_LB(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
+GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(
+  GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
 Preferences prefs;
@@ -1366,7 +1380,11 @@ void setup() {
 
   pinMode(EPD_PWR, OUTPUT);
   digitalWrite(EPD_PWR, HIGH); // power up the panel's regulator before talking to it
-  delay(50); // let the panel's regulator settle before driving SPI/RST into it
+  delay(200); // let the panel's regulator settle before driving SPI/RST into it —
+              // widened from 50ms to 200ms since BUSY being stuck HIGH forever
+              // on one unit raised the question of whether the regulator was
+              // fully up before RST/SPI started; cheap to try, costs nothing
+              // at boot either way
   Serial.println(F("[boot] EPD_PWR set HIGH, regulator should be up"));
 
   SPI.begin(EPD_SCLK, -1 /* MISO unused by the display */, EPD_MOSI, EPD_CS);
@@ -1383,7 +1401,8 @@ void setup() {
   pinMode(EPD_BUSY, INPUT);
   Serial.print(F("[diag] EPD_BUSY before reset: ")); Serial.println(digitalRead(EPD_BUSY));
   digitalWrite(EPD_RST, LOW);
-  delay(20);
+  delay(200); // widened from 20ms to 200ms — a longer hard-reset pulse, in case
+              // a too-short pulse was leaving the panel in a half-reset state
   digitalWrite(EPD_RST, HIGH);
   Serial.println(F("[diag] watching EPD_BUSY for 2s after a manual reset pulse (only level CHANGES are printed):"));
   {
