@@ -93,27 +93,18 @@
     - Button polarity: assumed active-LOW with internal pull-ups. If
       presses register backwards (or never register), flip BTN_ACTIVE_LOW
       below.
-    - BUSY pin stuck HIGH / "Busy Timeout!" / screen never updates: pins
-      and init call are confirmed to match the manufacturer's own
-      reference example (see Library note above), so if this still
-      happens, it points at the physical panel connection rather than
-      code — things worth checking on the actual unit: (1) the e-paper
-      panel's FPC ribbon cable fully seated and the connector's latch
-      fully closed (a half-seated cable is the single most common cause
-      of "everything looks right in software but nothing happens on the
-      panel"); (2) try a noticeably longer EPD_PWR settle delay (the
-      `delay(50)` after EPD_PWR goes HIGH, below) in case the panel's
-      internal boost regulator needs more time under this particular
-      unit/cable's load; (3) if neither helps, this may be a defective
-      panel/connector and worth raising with Elecrow support.
+    - BUSY pin polarity: standard HIGH=busy/LOW=ready (the GxEPD2 library's
+      own default for this driver class) — NOT inverted. An earlier attempt
+      inverted it to make "Busy Timeout!" go away, but that only masked the
+      symptom (the busy-wait returned instantly without the panel actually
+      having refreshed); that inverted-polarity driver has since been
+      removed from this sketch.
+    - BUSY pin stuck HIGH / "Busy Timeout!" / screen never updates: this
+      has shown up on two different panels now, so it's logged in detail —
+      see "Troubleshooting: Busy Timeout!" further down for the full
+      history and what's been ruled in/out on each one.
     - Screen rotation: display.setRotation(1) is a starting guess for
       landscape. Try 0/2/3 if the image is sideways or mirrored.
-    - BUSY pin polarity: this sketch currently assumes INVERTED polarity
-      (LOW = busy) based on a real-hardware diagnostic showing BUSY parked
-      HIGH indefinitely after reset. If timeouts persist even with the
-      vendored LOW-polarity driver, the BUSY pin/wiring itself (not just
-      polarity) is the more likely culprit — double check EPD_BUSY=48
-      against your actual board.
 
   BEFORE YOU FLASH:
   1. No Wi-Fi credentials to set here at all — flash as-is, then from the
@@ -125,6 +116,54 @@
      SPI ship with the ESP32 core.
   3. Board: "ESP32S3 Dev Module". Flash size 8MB, PSRAM enabled (required —
      the full-buffer GxEPD2 mode needs it), default partition scheme.
+
+  ======================================================================
+  TROUBLESHOOTING: "Busy Timeout!" / screen never updates — full history,
+  so a future round of debugging isn't starting from scratch:
+
+  Panel #1 (original unit): BUSY observed stuck HIGH indefinitely after
+  reset on every boot, every refresh call timing out. Ruled out in this
+  order: reset pulse duration/timing, EPD_PWR settle delay, a genuine
+  power-cycle (LOW then HIGH) vs. a bare HIGH, inverted BUSY polarity (a
+  vendored LOW-polarity driver made the timeout "go away" but only because
+  it stopped waiting at all — the panel never actually finished a refresh
+  and the screen stayed blank). Reset timing/pins were cross-checked
+  against Elecrow's own official demo firmware (cloned from their GitHub
+  repo, Elecrow-RD/ESP32_S3-Ink-Screen) and matched exactly. As a final
+  test, Elecrow's own demo was flashed directly onto this unit — it also
+  failed to update the screen, which is strong evidence against a firmware
+  bug in THIS sketch for that unit. Other owners of the same panel model
+  (DIE07300S, V1.0) report the identical symptom on Elecrow's own support
+  forum (forum.elecrow.com/discussion/comment/4333), with no fix offered
+  beyond a replacement. Conclusion for panel #1: likely a hardware defect.
+
+  Panel #2 (replacement unit): confirmed working fine (cycled through
+  multiple demo screens) immediately before this sketch was first flashed
+  onto it — then showed the exact same "Busy Timeout!" symptom right after.
+  Two different panels failing identically points away from "panel is
+  defective" and toward something panel-independent — either this firmware,
+  or the board/cable. The most likely firmware-side suspect: setup() had
+  accumulated a forced EPD_PWR power-cycle (LOW then HIGH) PLUS a full
+  manual RST-pulse-and-watch-BUSY diagnostic block, BOTH added while
+  debugging panel #1, running immediately before display.init()'s OWN
+  internal reset — i.e. two full reset sequences and a power cycle,
+  back-to-back, which no normal working firmware does. That's been removed
+  (see setup() below) so the panel now only sees one reset pulse total,
+  from display.init() itself, matching what the known-working demo firmware
+  that originally ran on this unit would have done.
+
+  If "Busy Timeout!" still happens on panel #2 with this simplified init
+  sequence, that's meaningful: it would point at the BOARD rather than
+  either panel — e.g. a damaged trace/cold joint on GPIO48 (EPD_BUSY), or a
+  half-seated FPC cable. Two concrete next steps in that case, neither
+  requiring a second board: (1) physically reseat the ribbon cable's
+  connector — a common cause of "everything looks right in software but
+  nothing happens on the panel"; (2) temporarily disconnect the panel
+  entirely and read EPD_BUSY in a two-line test sketch — if it still reads
+  HIGH with nothing connected, something upstream of the panel (on the
+  board) is pulling it there, which the panel was never going to be able
+  to override.
+  ======================================================================
 */
 
 #include <WiFi.h>
@@ -1380,72 +1419,33 @@ void setup() {
   pinMode(BTN_OK, INPUT_PULLUP);
 
   pinMode(EPD_PWR, OUTPUT);
-  // Force a REAL power cycle rather than just asserting HIGH. If EPD_PWR was
-  // already HIGH when this firmware started (e.g. the panel was mid-refresh
-  // under a previous/demo firmware when the board got reflashed), a bare
-  // digitalWrite(HIGH) is a no-op and the panel's regulator never actually
-  // resets — it just stays in whatever state the old firmware left it in.
-  // Confirmed known-working demo firmware on this exact unit drove the
-  // panel through multiple screens fine, so the panel/cable are not the
-  // problem; this targets "our firmware inherited a stuck panel state from
-  // the previous firmware" instead.
-  digitalWrite(EPD_PWR, LOW);
-  delay(200); // hold power off long enough for the regulator to fully discharge
-  digitalWrite(EPD_PWR, HIGH); // now a genuine off->on transition
-  delay(200); // let the panel's regulator settle before driving SPI/RST into it
-  Serial.println(F("[boot] EPD_PWR power-cycled (LOW then HIGH), regulator should be up"));
+  // UPDATE: this used to force a hard LOW->HIGH power cycle here, plus a
+  // whole manual RST-pulse-and-watch-BUSY diagnostic block below, both
+  // added while debugging a panel that turned out to likely be genuinely
+  // defective (see the troubleshooting note near the top of this file).
+  // Tested against a second, known-good panel (worked fine right up until
+  // this firmware was flashed onto it), that extra pre-reset machinery is
+  // the more likely culprit — TWO full reset sequences back to back (this
+  // one, then another inside display.init() itself) plus a forced power
+  // cycle is more aggressive than any working reference firmware does, and
+  // can plausibly leave the panel's internal state machine somewhere
+  // display.init()'s own reset doesn't expect, so the first real refresh
+  // afterward hangs. Simplified back down to a single, boring power-up +
+  // the library's own one init()-internal reset, matching what a normal
+  // working firmware does. If "Busy Timeout!" still happens with this
+  // simpler sequence, that's much stronger evidence of an actual
+  // board/panel/cable problem rather than something this firmware is doing.
+  digitalWrite(EPD_PWR, HIGH);
+  delay(50); // let the panel's regulator settle before driving SPI into it
+  Serial.println(F("[boot] EPD_PWR set HIGH, regulator should be up"));
 
   SPI.begin(EPD_SCLK, -1 /* MISO unused by the display */, EPD_MOSI, EPD_CS);
-
-  // ---- TEMPORARY DIAGNOSTIC: raw BUSY pin behavior ----
-  // Bypasses GxEPD2 entirely and pulses RST by hand, then watches the raw
-  // EPD_BUSY level for 2 seconds. This tells us what the panel's BUSY line
-  // is actually doing, independent of which GxEPD2 driver class is used —
-  // if it never changes at all, that points to wrong pin/wiring; if it
-  // toggles but settles "backwards" from what's expected (documented as
-  // HIGH=busy, LOW=ready for this panel), that confirms inverted polarity.
-  // Safe to delete this whole block once the real cause is found.
-  pinMode(EPD_RST, OUTPUT);
-  pinMode(EPD_BUSY, INPUT);
-  Serial.print(F("[diag] EPD_BUSY before reset: ")); Serial.println(digitalRead(EPD_BUSY));
-  // Reset sequence copied EXACTLY from Elecrow's own official demo firmware
-  // for this board (EPD_RESET() in their EPD.cpp, from their GitHub repo
-  // Elecrow-RD/ESP32_S3-Ink-Screen). Their version explicitly asserts RST
-  // HIGH first and lets it settle for 100ms BEFORE pulsing LOW — our
-  // previous diagnostic pulsed straight to LOW with no prior HIGH settle,
-  // which may not register as a clean reset edge if the pin's power-up
-  // state was ambiguous. This is their exact HIGH(100ms)/LOW(10ms)/HIGH(10ms)
-  // timing, not a guess.
-  digitalWrite(EPD_RST, HIGH);
-  delay(100);
-  digitalWrite(EPD_RST, LOW);
-  delay(10);
-  digitalWrite(EPD_RST, HIGH);
-  delay(10);
-  Serial.println(F("[diag] watching EPD_BUSY for 2s after a manual reset pulse (only level CHANGES are printed):"));
-  {
-    unsigned long diagStart = millis();
-    int lastLevel = -1;
-    while (millis() - diagStart < 2000) {
-      int level = digitalRead(EPD_BUSY);
-      if (level != lastLevel) {
-        Serial.print(F("[diag]   t="));
-        Serial.print(millis() - diagStart);
-        Serial.print(F("ms BUSY="));
-        Serial.println(level);
-        lastLevel = level;
-      }
-    }
-  }
-  Serial.println(F("[diag] done watching BUSY — if nothing printed above besides the first line, BUSY never changed at all"));
-  // ---- end diagnostic ----
 
   Serial.println(F("[boot] SPI.begin() done, calling display.init()..."));
   // reset_duration=50 (vs. the library default's shorter pulse): a
   // community-tested working setup for this exact panel uses a 50ms reset
-  // pulse. A too-short reset can leave the panel in a state where BUSY
-  // never clears, producing "Busy Timeout!" on the very first refresh —
-  // which is the exact symptom this was added to fix.
+  // pulse. This is now the ONLY reset pulse sent to the panel — display.init()
+  // drives EPD_RST itself, so there's no separate manual reset before this.
   display.init(115200, true, 50, false);
   Serial.println(F("[boot] display.init() returned — if you never saw this line, it hung waiting on the panel (BUSY pin most likely)"));
   display.setRotation(1); // landscape; try 0/2/3 if the image is sideways/mirrored on your unit
