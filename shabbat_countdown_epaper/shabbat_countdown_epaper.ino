@@ -253,6 +253,16 @@ bool hasWallClock = false;
 // setSystemTimeManually()'s comment) — computeShabbatTimes() needs to know
 // this so it can line up its true-UTC solar calculation with that clock.
 bool clockIsLocalLabeled = false;
+
+// Per-city UTC offset + DST rule, captured from CITY_LIST (cities.h) when a
+// city is picked via selectCity(). 255 is the "unset" sentinel — meaning
+// either no city has ever been picked, or the location came from a ZIP code
+// instead (which has no such table), so solarEpochShiftFor() should fall
+// back to the old longitude/hemisphere guess (roughUtcOffsetFromLongitude +
+// guessDstActive) rather than use these two fields.
+float cityUtcOffsetHours = 0.0f;
+uint8_t cityDstRule = 255;
+
 unsigned long lastNtpAttemptMs = 0;
 const unsigned long NTP_RETRY_INTERVAL_MS  = 5UL  * 60UL * 1000UL; // retry every 5 min until synced
 const unsigned long NTP_RESYNC_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL; // then resync every 6 hrs
@@ -409,11 +419,141 @@ static time_t sunsetEpochFor(int year, int month, int day, double lat, double lo
   return utcToEpoch(year, month, day, 0, 0, 0) + (time_t)lround(utcHours * 3600.0);
 }
 
-// Rough, DST-ignorant UTC offset estimate from longitude alone (15 degrees
-// per hour) — the same formula already used elsewhere in this file whenever
-// a real timezone lookup isn't available (e.g. IP geolocation failing).
+// Rough, STANDARD-time (no DST) UTC offset estimate from longitude alone
+// (15 degrees per hour) — the same formula already used elsewhere in this
+// file whenever a real timezone lookup isn't available (e.g. IP geolocation
+// failing).
 static long roughUtcOffsetFromLongitude(double lon) {
   return (long)lround(lon / 15.0) * 3600;
+}
+
+// Returns the day-of-month of the Nth Sunday of the given month/year (n=1
+// for the first Sunday, 2 for the second, etc). Used below to find the
+// conventional US/Canada-style DST transition dates.
+static int nthSundayOfMonth(int year, int month, int n) {
+  int count = 0;
+  for (int day = 1; day <= 31; day++) {
+    long days = daysFromCivil(year, month, day);
+    int w = (int)((days + 4) % 7); // Sunday=0 .. Saturday=6, same formula as computeShabbatTimes()
+    if (w == 0) {
+      count++;
+      if (count == n) return day;
+    }
+  }
+  return 1; // unreachable for a real calendar month
+}
+
+// Very rough daylight-saving guess, used ONLY for the fully-offline clock
+// (see clockIsLocalLabeled below) where there's no network to ask a real
+// timezone database. Assumes the common US/Canada-style window — DST from
+// the 2nd Sunday in March to the 1st Sunday in November — for the Northern
+// Hemisphere, and the mirror-image window (around October to April) for the
+// Southern Hemisphere. This is NOT correct everywhere (exact DST rules, and
+// whether a country observes DST at all, vary), but it's a large accuracy
+// improvement over assuming standard time year-round, which is off by a
+// full hour for roughly two-thirds of the year in the US.
+static bool guessDstActive(int year, int month, int day, double lat) {
+  long days = daysFromCivil(year, month, day);
+  if (lat >= 0) {
+    long startDays = daysFromCivil(year, 3, nthSundayOfMonth(year, 3, 2));
+    long endDays = daysFromCivil(year, 11, nthSundayOfMonth(year, 11, 1));
+    return (days >= startDays) && (days < endDays);
+  } else {
+    long startDays = daysFromCivil(year, 10, nthSundayOfMonth(year, 10, 1));
+    long endDays = daysFromCivil(year, 4, nthSundayOfMonth(year, 4, 1));
+    return (days >= startDays) || (days < endDays); // window wraps the new year
+  }
+}
+
+// Days in the given month (Gregorian, with leap-year-aware February). Used
+// by lastSundayOfMonth() below.
+static int daysInMonth(int year, int month) {
+  static const int DAYS[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month == 2) {
+    bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return DAYS[month - 1];
+}
+
+// Returns the day-of-month of the LAST Sunday of the given month/year —
+// the transition rule used by the EU and (with a two-day offset) Israel.
+static int lastSundayOfMonth(int year, int month) {
+  int lastDay = daysInMonth(year, month);
+  for (int day = lastDay; day >= lastDay - 6; day--) {
+    long days = daysFromCivil(year, month, day);
+    int w = (int)((days + 4) % 7); // Sunday=0 .. Saturday=6
+    if (w == 0) return day;
+  }
+  return lastDay; // unreachable
+}
+
+// Is DST active on the given date, under the given CITY_DST_* rule (see
+// cities.h)? This is the exact, per-city replacement for the old
+// guessDstActive() hemisphere guess below, used whenever a city was picked
+// from CITY_LIST (cityDstRule != 255) instead of a ZIP code.
+static bool dstRuleActive(uint8_t rule, int year, int month, int day) {
+  long days = daysFromCivil(year, month, day);
+  switch (rule) {
+    case CITY_DST_US: {
+      // 2nd Sunday in March -> 1st Sunday in November
+      long startDays = daysFromCivil(year, 3, nthSundayOfMonth(year, 3, 2));
+      long endDays = daysFromCivil(year, 11, nthSundayOfMonth(year, 11, 1));
+      return (days >= startDays) && (days < endDays);
+    }
+    case CITY_DST_EU: {
+      // last Sunday in March -> last Sunday in October
+      long startDays = daysFromCivil(year, 3, lastSundayOfMonth(year, 3));
+      long endDays = daysFromCivil(year, 10, lastSundayOfMonth(year, 10));
+      return (days >= startDays) && (days < endDays);
+    }
+    case CITY_DST_AU: {
+      // 1st Sunday in October -> 1st Sunday in April (Southern Hemisphere,
+      // wraps the calendar year)
+      long startDays = daysFromCivil(year, 10, nthSundayOfMonth(year, 10, 1));
+      long endDays = daysFromCivil(year, 4, nthSundayOfMonth(year, 4, 1));
+      return (days >= startDays) || (days < endDays);
+    }
+    case CITY_DST_NZ: {
+      // last Sunday in September -> 1st Sunday in April (wraps the year)
+      long startDays = daysFromCivil(year, 9, lastSundayOfMonth(year, 9));
+      long endDays = daysFromCivil(year, 4, nthSundayOfMonth(year, 4, 1));
+      return (days >= startDays) || (days < endDays);
+    }
+    case CITY_DST_IL: {
+      // Israel: the Friday before the last Sunday in March -> the last
+      // Sunday in October. "Friday before" the last Sunday is simply two
+      // days earlier on the calendar.
+      long startDays = daysFromCivil(year, 3, lastSundayOfMonth(year, 3)) - 2;
+      long endDays = daysFromCivil(year, 10, lastSundayOfMonth(year, 10));
+      return (days >= startDays) && (days < endDays);
+    }
+    case CITY_DST_NONE:
+    default:
+      return false;
+  }
+}
+
+// The epoch shift needed to convert sunsetEpochFor()'s true-UTC result for
+// the given date into the same "local-labeled" epoch space as the
+// fully-offline manually-set clock (see clockIsLocalLabeled and
+// setSystemTimeManually()). Zero when the clock is genuinely UTC (NTP path).
+//
+// Prefers the exact per-city table data (cityUtcOffsetHours/cityDstRule,
+// captured in selectCity() from cities.h) whenever a city was picked;
+// falls back to the old longitude/hemisphere guess only when no city table
+// entry is available (cityDstRule == 255 — e.g. a ZIP-code-based location,
+// which has no such table).
+static long solarEpochShiftFor(int year, int month, int day) {
+  if (!clockIsLocalLabeled) return 0;
+  if (cityDstRule != 255) {
+    long shift = (long)lround(cityUtcOffsetHours * 3600.0);
+    if (dstRuleActive(cityDstRule, year, month, day)) shift += 3600;
+    return shift;
+  }
+  long shift = roughUtcOffsetFromLongitude(longitude);
+  if (guessDstActive(year, month, day, latitude)) shift += 3600;
+  return shift;
 }
 
 // ---------------- Compute this/next Shabbat's candle-lighting + havdalah ----------------
@@ -426,13 +566,11 @@ void computeShabbatTimes() {
   // SET TIME path, time(nullptr) instead holds LOCAL wall-clock values
   // mislabeled as a UTC epoch (see setSystemTimeManually()). Left
   // uncorrected, that mismatch shows up as candle-lighting/havdalah times
-  // that are off by the location's entire UTC offset (several hours) —
-  // exactly the "calculated wrong" symptom this fixes. Shifting the solar
-  // result by a rough longitude-based offset lines it back up with the
-  // local-labeled clock; this shift is a no-op (0) whenever the clock is
-  // genuinely UTC (the normal NTP path).
-  long solarEpochShift = clockIsLocalLabeled ? roughUtcOffsetFromLongitude(longitude) : 0;
-
+  // that are off by the location's entire UTC offset (several hours).
+  // solarEpochShiftFor() (computed per-date, since DST status depends on
+  // the date) lines the solar result back up with the local-labeled clock;
+  // it's a no-op (0) whenever the clock is genuinely UTC (the normal NTP
+  // path).
   long daysSinceEpoch = now / 86400;
   int weekday = (int)((daysSinceEpoch + 4) % 7);
   int daysSinceFriday = (weekday - 5 + 7) % 7;
@@ -441,11 +579,11 @@ void computeShabbatTimes() {
   for (int attempt = 0; attempt < 2; attempt++) {
     int fy, fm, fd;
     civilFromDays(fridayDays, fy, fm, fd);
-    time_t fridaySunset = sunsetEpochFor(fy, fm, fd, latitude, longitude) + solarEpochShift;
+    time_t fridaySunset = sunsetEpochFor(fy, fm, fd, latitude, longitude) + solarEpochShiftFor(fy, fm, fd);
 
     int sy, sm, sd;
     civilFromDays(fridayDays + 1, sy, sm, sd);
-    time_t satSunset = sunsetEpochFor(sy, sm, sd, latitude, longitude) + solarEpochShift;
+    time_t satSunset = sunsetEpochFor(sy, sm, sd, latitude, longitude) + solarEpochShiftFor(sy, sm, sd);
 
     time_t candidateCandle = fridaySunset - (time_t)CANDLE_LIGHTING_MINUTES * 60;
     time_t candidateHavdalah = satSunset + (time_t)havdalahOffsetMin * 60;
@@ -570,6 +708,8 @@ void loadSettings() {
   hasWifiCreds = currentSsid.length() > 0;
   usingCity = prefs.getBool("usingCity", false);
   currentCityLabel = prefs.getString("cityLbl", "");
+  cityUtcOffsetHours = prefs.getFloat("cityUtcOff", 0.0f);
+  cityDstRule = (uint8_t)prefs.getUInt("cityDst", 255);
   setupDone = prefs.getBool("setupDone", false);
   prefs.end();
 }
@@ -606,9 +746,16 @@ void saveZip(const String &zip) {
   prefs.begin("shabbat", false);
   prefs.putString("zip", zip);
   prefs.putBool("usingCity", false); // switch the header back to ZIP display
+  // A ZIP code has no per-city DST-table entry, so clear any leftover city
+  // data from a previous selectCity() call — otherwise solarEpochShiftFor()
+  // would keep using a stale, unrelated city's offset/DST rule.
+  prefs.putFloat("cityUtcOff", 0.0f);
+  prefs.putUInt("cityDst", 255);
   prefs.end();
   currentZip = zip;
   usingCity = false;
+  cityUtcOffsetHours = 0.0f;
+  cityDstRule = 255;
 }
 
 // Picks a location from the built-in CITY_LIST (cities.h) instead of a US
@@ -625,6 +772,8 @@ void selectCity(int idx) {
   currentCityLabel = (comma >= 0) ? full.substring(0, comma) : full;
   currentCityLabel.toUpperCase();
   usingCity = true;
+  cityUtcOffsetHours = CITY_LIST[idx].utcOffsetHours;
+  cityDstRule = CITY_LIST[idx].dstRule;
 
   prefs.begin("shabbat", false);
   prefs.putDouble("lat", latitude);
@@ -632,6 +781,8 @@ void selectCity(int idx) {
   prefs.putBool("hasCoords", true);
   prefs.putBool("usingCity", true);
   prefs.putString("cityLbl", currentCityLabel);
+  prefs.putFloat("cityUtcOff", cityUtcOffsetHours);
+  prefs.putUInt("cityDst", (uint32_t)cityDstRule);
   prefs.end();
 
   hasCoords = true;
@@ -1218,6 +1369,8 @@ void performSystemReset() {
   hasWifiCreds = false;
   usingCity = false;
   currentCityLabel = "";
+  cityUtcOffsetHours = 0.0f;
+  cityDstRule = 255;
   setupDone = false;
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
