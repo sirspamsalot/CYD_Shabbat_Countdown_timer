@@ -116,7 +116,7 @@ const int CANDLE_LIGHTING_MINUTES = 18;
 
 const char* DEFAULT_ZIP = "89169";        // used only if no ZIP has been saved yet
 const int DEFAULT_HAVDALAH_OFFSET_MIN = 42; // "3 medium stars" — 42 min after sunset; adjustable in Settings
-const int DEFAULT_BRIGHTNESS_PCT = 100;
+const int DEFAULT_BRIGHTNESS_PCT = 50;
 // ======================================
 
 // ---------- CYD (Sunton ESP32-2432S028R) pins ----------
@@ -205,6 +205,22 @@ String lastHeaderTime = ""; // last string drawn by drawHeaderTime(), so it only
 // attemptNtpSync() — so this flips true automatically whenever a
 // connection becomes available, with no reboot required.
 bool hasWallClock = false;
+// True only when the system clock was set via setSystemTimeManually() (the
+// fully-offline SET TIME path) rather than from NTP. In that mode
+// time(nullptr) holds LOCAL wall-clock values mislabeled as a UTC epoch
+// (see setSystemTimeManually()'s comment) — computeShabbatTimes() needs to
+// know this so it can line up its true-UTC solar calculation with that
+// clock (see solarEpochShiftFor()).
+bool clockIsLocalLabeled = false;
+
+// Per-city UTC offset + DST rule, captured from CITY_LIST (cities.h) when a
+// city is picked via selectCity(). 255 is the "unset" sentinel — meaning
+// either no city has ever been picked, or the location came from a ZIP code
+// instead (which has no such table), so solarEpochShiftFor() should fall
+// back to the old longitude/hemisphere guess instead of using these fields.
+float cityUtcOffsetHours = 0.0f;
+uint8_t cityDstRule = 255;
+
 unsigned long lastNtpAttemptMs = 0;
 const unsigned long NTP_RETRY_INTERVAL_MS  = 5UL  * 60UL * 1000UL; // retry every 5 min until synced
 const unsigned long NTP_RESYNC_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL; // then resync every 6 hrs to correct drift
@@ -408,6 +424,128 @@ static time_t sunsetEpochFor(int year, int month, int day, double lat, double lo
   return utcToEpoch(year, month, day, 0, 0, 0) + (time_t)lround(utcHours * 3600.0);
 }
 
+// Rough, STANDARD-time (no DST) UTC offset estimate from longitude alone
+// (15 degrees per hour) — used as a last-resort fallback by
+// solarEpochShiftFor() below when no per-city table entry is available.
+static long roughUtcOffsetFromLongitude(double lon) {
+  return (long)lround(lon / 15.0) * 3600;
+}
+
+// Returns the day-of-month of the Nth Sunday of the given month/year (n=1
+// for the first Sunday, 2 for the second, etc).
+static int nthSundayOfMonth(int year, int month, int n) {
+  int count = 0;
+  for (int day = 1; day <= 31; day++) {
+    long days = daysFromCivil(year, month, day);
+    int w = (int)((days + 4) % 7); // Sunday=0 .. Saturday=6, same formula as computeShabbatTimes()
+    if (w == 0) {
+      count++;
+      if (count == n) return day;
+    }
+  }
+  return 1; // unreachable for a real calendar month
+}
+
+// Days in the given month (Gregorian, with leap-year-aware February). Used
+// by lastSundayOfMonth() below.
+static int daysInMonth(int year, int month) {
+  static const int DAYS[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month == 2) {
+    bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return DAYS[month - 1];
+}
+
+// Returns the day-of-month of the LAST Sunday of the given month/year —
+// the transition rule used by the EU and (with a two-day offset) Israel.
+static int lastSundayOfMonth(int year, int month) {
+  int lastDay = daysInMonth(year, month);
+  for (int day = lastDay; day >= lastDay - 6; day--) {
+    long days = daysFromCivil(year, month, day);
+    int w = (int)((days + 4) % 7); // Sunday=0 .. Saturday=6
+    if (w == 0) return day;
+  }
+  return lastDay; // unreachable
+}
+
+// Very rough daylight-saving guess, used ONLY as a fallback for a
+// ZIP-code-based location (no per-city DST-table entry — see
+// solarEpochShiftFor() below). Assumes the common US/Canada-style window —
+// DST from the 2nd Sunday in March to the 1st Sunday in November — for the
+// Northern Hemisphere, and the mirror-image window (around October to
+// April) for the Southern Hemisphere. This is NOT correct everywhere, but
+// it's a large accuracy improvement over assuming standard time year-round.
+static bool guessDstActive(int year, int month, int day, double lat) {
+  long days = daysFromCivil(year, month, day);
+  if (lat >= 0) {
+    long startDays = daysFromCivil(year, 3, nthSundayOfMonth(year, 3, 2));
+    long endDays = daysFromCivil(year, 11, nthSundayOfMonth(year, 11, 1));
+    return (days >= startDays) && (days < endDays);
+  } else {
+    long startDays = daysFromCivil(year, 10, nthSundayOfMonth(year, 10, 1));
+    long endDays = daysFromCivil(year, 4, nthSundayOfMonth(year, 4, 1));
+    return (days >= startDays) || (days < endDays); // window wraps the new year
+  }
+}
+
+// Is DST active on the given date, under the given CITY_DST_* rule (see
+// cities.h)? The exact, per-city replacement for guessDstActive() above,
+// used whenever a city was picked from CITY_LIST (cityDstRule != 255).
+static bool dstRuleActive(uint8_t rule, int year, int month, int day) {
+  long days = daysFromCivil(year, month, day);
+  switch (rule) {
+    case CITY_DST_US: {
+      long startDays = daysFromCivil(year, 3, nthSundayOfMonth(year, 3, 2));
+      long endDays = daysFromCivil(year, 11, nthSundayOfMonth(year, 11, 1));
+      return (days >= startDays) && (days < endDays);
+    }
+    case CITY_DST_EU: {
+      long startDays = daysFromCivil(year, 3, lastSundayOfMonth(year, 3));
+      long endDays = daysFromCivil(year, 10, lastSundayOfMonth(year, 10));
+      return (days >= startDays) && (days < endDays);
+    }
+    case CITY_DST_AU: {
+      long startDays = daysFromCivil(year, 10, nthSundayOfMonth(year, 10, 1));
+      long endDays = daysFromCivil(year, 4, nthSundayOfMonth(year, 4, 1));
+      return (days >= startDays) || (days < endDays);
+    }
+    case CITY_DST_NZ: {
+      long startDays = daysFromCivil(year, 9, lastSundayOfMonth(year, 9));
+      long endDays = daysFromCivil(year, 4, nthSundayOfMonth(year, 4, 1));
+      return (days >= startDays) || (days < endDays);
+    }
+    case CITY_DST_IL: {
+      long startDays = daysFromCivil(year, 3, lastSundayOfMonth(year, 3)) - 2; // Friday before
+      long endDays = daysFromCivil(year, 10, lastSundayOfMonth(year, 10));
+      return (days >= startDays) && (days < endDays);
+    }
+    case CITY_DST_NONE:
+    default:
+      return false;
+  }
+}
+
+// The epoch shift needed to convert sunsetEpochFor()'s true-UTC result for
+// the given date into the same "local-labeled" epoch space as the
+// fully-offline manually-set clock (see clockIsLocalLabeled and
+// setSystemTimeManually()). Zero when the clock is genuinely UTC (NTP path).
+// Prefers the exact per-city table data (cityUtcOffsetHours/cityDstRule,
+// captured in selectCity() from cities.h); falls back to the old
+// longitude/hemisphere guess only when no city table entry is available
+// (cityDstRule == 255 — e.g. a ZIP-code-based location).
+static long solarEpochShiftFor(int year, int month, int day) {
+  if (!clockIsLocalLabeled) return 0;
+  if (cityDstRule != 255) {
+    long shift = (long)lround(cityUtcOffsetHours * 3600.0);
+    if (dstRuleActive(cityDstRule, year, month, day)) shift += 3600;
+    return shift;
+  }
+  long shift = roughUtcOffsetFromLongitude(longitude);
+  if (guessDstActive(year, month, day, latitude)) shift += 3600;
+  return shift;
+}
+
 // ---------------- Compute this/next Shabbat's candle-lighting + havdalah ----------------
 // Always finds the most recent Friday (today, if today IS Friday), checks
 // whether we're still inside that Shabbat window, and rolls forward a full
@@ -422,11 +560,11 @@ void computeShabbatTimes() {
   for (int attempt = 0; attempt < 2; attempt++) {
     int fy, fm, fd;
     civilFromDays(fridayDays, fy, fm, fd);
-    time_t fridaySunset = sunsetEpochFor(fy, fm, fd, latitude, longitude);
+    time_t fridaySunset = sunsetEpochFor(fy, fm, fd, latitude, longitude) + solarEpochShiftFor(fy, fm, fd);
 
     int sy, sm, sd;
     civilFromDays(fridayDays + 1, sy, sm, sd);
-    time_t satSunset = sunsetEpochFor(sy, sm, sd, latitude, longitude);
+    time_t satSunset = sunsetEpochFor(sy, sm, sd, latitude, longitude) + solarEpochShiftFor(sy, sm, sd);
 
     time_t candidateCandle = fridaySunset - (time_t)CANDLE_LIGHTING_MINUTES * 60;
     time_t candidateHavdalah = satSunset + (time_t)havdalahOffsetMin * 60;
@@ -529,13 +667,16 @@ void doGeocode() {
     saveCoords(latitude, longitude);
     needsGeocode = false;
     if (hasWallClock) {
-      // Always re-derive the timezone for this newly-picked location — it
-      // may be a different timezone than wherever the device's own Wi-Fi
-      // network is, so the earlier IP-based guess (or a previous ZIP/city's
-      // offset) must not be left in place.
-      if (!fetchTimezoneForCoords(latitude, longitude)) {
-        localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
-        saveUtcOffset();
+      // Only hit the network here when we're actually online — the
+      // fully-offline SET TIME + CITY path already has the correct local
+      // time from setSystemTimeManually() (offset 0); touching the offset
+      // with no network to check against would corrupt an already-correct
+      // clock, and picking a location offline only matters for solar math.
+      if (WiFi.status() == WL_CONNECTED) {
+        if (!fetchTimezoneForCoords(latitude, longitude)) {
+          localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
+          saveUtcOffset();
+        }
       }
       computeShabbatTimes();
     }
@@ -581,6 +722,8 @@ void loadSettings() {
   hasWifiCreds = currentSsid.length() > 0 && currentSsid != "YOUR_WIFI_SSID";
   usingCity = prefs.getBool("usingCity", false);
   currentCityLabel = prefs.getString("cityLbl", "");
+  cityUtcOffsetHours = prefs.getFloat("cityUtcOff", 0.0f);
+  cityDstRule = (uint8_t)prefs.getUInt("cityDst", 255);
   setupDone = prefs.getBool("setupDone", false);
   prefs.end();
 }
@@ -596,9 +739,16 @@ void saveZip(const String &zip) {
   prefs.begin("shabbat", false);
   prefs.putString("zip", zip);
   prefs.putBool("usingCity", false); // switch the header back to ZIP display
+  // A ZIP code has no per-city DST-table entry, so clear any leftover city
+  // data from a previous selectCity() call — otherwise solarEpochShiftFor()
+  // would keep using a stale, unrelated city's offset/DST rule.
+  prefs.putFloat("cityUtcOff", 0.0f);
+  prefs.putUInt("cityDst", 255);
   prefs.end();
   currentZip = zip;
   usingCity = false;
+  cityUtcOffsetHours = 0.0f;
+  cityDstRule = 255;
 }
 
 void saveCoords(double lat, double lon) {
@@ -624,6 +774,8 @@ void selectCity(int idx) {
   currentCityLabel = (comma >= 0) ? full.substring(0, comma) : full;
   currentCityLabel.toUpperCase();
   usingCity = true;
+  cityUtcOffsetHours = CITY_LIST[idx].utcOffsetHours;
+  cityDstRule = CITY_LIST[idx].dstRule;
 
   prefs.begin("shabbat", false);
   prefs.putDouble("lat", latitude);
@@ -631,6 +783,8 @@ void selectCity(int idx) {
   prefs.putBool("hasCoords", true);
   prefs.putBool("usingCity", true);
   prefs.putString("cityLbl", currentCityLabel);
+  prefs.putFloat("cityUtcOff", cityUtcOffsetHours);
+  prefs.putUInt("cityDst", (uint32_t)cityDstRule);
   prefs.end();
 
   hasCoords = true;
@@ -638,13 +792,20 @@ void selectCity(int idx) {
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
   if (hasWallClock) {
-    // Always re-derive the timezone for this newly-picked location — it
-    // may be a different timezone than wherever the device's own Wi-Fi
-    // network is, so the earlier IP-based guess (or a previous ZIP/city's
-    // offset) must not be left in place.
-    if (!fetchTimezoneForCoords(latitude, longitude)) {
-      localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
-      saveUtcOffset();
+    // Always re-derive the timezone for this newly-picked location when
+    // we're actually online — it may be a different timezone than
+    // wherever the device's own Wi-Fi network is, so the earlier
+    // IP-based guess (or a previous ZIP/city's offset) must not be left
+    // in place. But if we're offline (the fully-offline SET TIME + CITY
+    // first-run path), the clock already holds the correct local time
+    // from setSystemTimeManually() (offset 0) — leave it alone, since
+    // there's no network to check a real timezone against anyway, and
+    // the longitude fallback would only corrupt an already-correct clock.
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!fetchTimezoneForCoords(latitude, longitude)) {
+        localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
+        saveUtcOffset();
+      }
     }
     computeShabbatTimes();
   }
@@ -707,6 +868,7 @@ void saveWifiCreds(const String &ssid, const String &pass) {
   // Try connecting right away instead of waiting for the next background
   // retry, so entering credentials gives immediate feedback.
   hasWallClock = attemptNtpSync(15000, 8000, true);
+  clockIsLocalLabeled = false; // NTP-synced clock is true UTC
   lastNtpAttemptMs = millis();
   if (hasWallClock) {
     fetchTimezoneFromIP();
@@ -981,10 +1143,15 @@ void drawCountdownFrame() {
     return;
   }
 
-  printCentered("TIME REMAINING", 160, 38, 3, COLOR_ACCENT, COLOR_BG);
+  printCentered("TIME REMAINING", 160, 40, 3, COLOR_ACCENT, COLOR_BG);
 
-  int fx0 = digitX[0] - 14, fy0 = CLOCK_Y - 12;
-  int fx1 = digitX[6] + DIGIT_W + 14, fy1 = CLOCK_Y + DIGIT_H + 22;
+  // Horizontal padding trimmed from 14 to 9: at 14, the box's left/right
+  // edges landed just past the screen's 0-319 bounds (-3 and 322), so only
+  // the top/bottom horizontal lines actually rendered — the left/right
+  // verticals were clipped off-screen. 9px keeps the full box on-screen
+  // with a couple of pixels to spare on each side.
+  int fx0 = digitX[0] - 9, fy0 = CLOCK_Y - 12;
+  int fx1 = digitX[6] + DIGIT_W + 9, fy1 = CLOCK_Y + DIGIT_H + 22;
   tft.drawRoundRect(fx0, fy0, fx1 - fx0, fy1 - fy0, 8, COLOR_PANEL_EDGE);
 
   String candleLine = "CANDLES " + formatLocalTime(candleLightingEpoch);
@@ -1268,10 +1435,13 @@ void performSystemReset() {
   hasWifiCreds = false;
   usingCity = false;
   currentCityLabel = "";
+  cityUtcOffsetHours = 0.0f;
+  cityDstRule = 255;
   setupDone = false;
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
   hasWallClock = false;
+  clockIsLocalLabeled = false;
   needsGeocode = false;
   screenNeedsFullRedraw = true;
   applyBrightness();
@@ -1442,15 +1612,18 @@ void handleKeypadTouch(int16_t x, int16_t y) {
           time_t nowUtc = time(nullptr);
           localUtcOffsetSeconds = (long)(enteredLocalEpoch - nowUtc);
           saveUtcOffset();
+          clockIsLocalLabeled = false;
         } else {
           // Offline path: no NTP reference exists at all, so set the
           // system clock directly to the entered LOCAL time and keep the
-          // offset at 0 — a self-consistent epoch+offset pair is all
-          // formatLocalTime()/computeShabbatTimes() need.
+          // offset at 0. Unlike the online path, this clock holds LOCAL
+          // values mislabeled as UTC, so clockIsLocalLabeled is set so
+          // computeShabbatTimes()'s solarEpochShiftFor() can correct for it.
           setSystemTimeManually(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute);
           localUtcOffsetSeconds = 0;
           saveUtcOffset();
           hasWallClock = true;
+          clockIsLocalLabeled = true;
         }
         if (hasCoords) computeShabbatTimes();
         if (firstRunActive) {
@@ -1677,6 +1850,7 @@ void setup() {
   // we carry on without one instead of hanging here forever. loop() keeps
   // retrying quietly in the background so a later connection still syncs.
   hasWallClock = attemptNtpSync(15000, 8000, true);
+  clockIsLocalLabeled = false; // NTP-synced clock is true UTC
   lastNtpAttemptMs = millis();
 
   if (hasWallClock) {
@@ -1717,6 +1891,7 @@ void loop() {
           bool hadWallClock = hasWallClock;
           if (attemptNtpSync(6000, 5000, false)) {
             hasWallClock = true;
+            clockIsLocalLabeled = false; // NTP-synced clock is true UTC
             fetchTimezoneFromIP();
             if (!hadWallClock) {
               // First time we've ever gotten a real clock this boot —
