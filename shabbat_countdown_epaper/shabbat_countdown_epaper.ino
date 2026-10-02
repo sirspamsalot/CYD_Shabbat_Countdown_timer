@@ -247,6 +247,12 @@ bool needsGeocode = false;
 bool screenNeedsFullRedraw = true;
 
 bool hasWallClock = false;
+// True only when the system clock was set via setSystemTimeManually() (the
+// fully-offline SET TIME path) rather than from NTP. In that mode time(nullptr)
+// holds LOCAL wall-clock values mislabeled as a UTC epoch (see
+// setSystemTimeManually()'s comment) — computeShabbatTimes() needs to know
+// this so it can line up its true-UTC solar calculation with that clock.
+bool clockIsLocalLabeled = false;
 unsigned long lastNtpAttemptMs = 0;
 const unsigned long NTP_RETRY_INTERVAL_MS  = 5UL  * 60UL * 1000UL; // retry every 5 min until synced
 const unsigned long NTP_RESYNC_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL; // then resync every 6 hrs
@@ -403,9 +409,30 @@ static time_t sunsetEpochFor(int year, int month, int day, double lat, double lo
   return utcToEpoch(year, month, day, 0, 0, 0) + (time_t)lround(utcHours * 3600.0);
 }
 
+// Rough, DST-ignorant UTC offset estimate from longitude alone (15 degrees
+// per hour) — the same formula already used elsewhere in this file whenever
+// a real timezone lookup isn't available (e.g. IP geolocation failing).
+static long roughUtcOffsetFromLongitude(double lon) {
+  return (long)lround(lon / 15.0) * 3600;
+}
+
 // ---------------- Compute this/next Shabbat's candle-lighting + havdalah ----------------
 void computeShabbatTimes() {
   time_t now = time(nullptr);
+
+  // sunsetEpochFor() always returns a TRUE UTC instant (it's a straight
+  // astronomical calculation from the calendar date + lat/lon). That matches
+  // time(nullptr) when the clock came from NTP — but in the fully-offline
+  // SET TIME path, time(nullptr) instead holds LOCAL wall-clock values
+  // mislabeled as a UTC epoch (see setSystemTimeManually()). Left
+  // uncorrected, that mismatch shows up as candle-lighting/havdalah times
+  // that are off by the location's entire UTC offset (several hours) —
+  // exactly the "calculated wrong" symptom this fixes. Shifting the solar
+  // result by a rough longitude-based offset lines it back up with the
+  // local-labeled clock; this shift is a no-op (0) whenever the clock is
+  // genuinely UTC (the normal NTP path).
+  long solarEpochShift = clockIsLocalLabeled ? roughUtcOffsetFromLongitude(longitude) : 0;
+
   long daysSinceEpoch = now / 86400;
   int weekday = (int)((daysSinceEpoch + 4) % 7);
   int daysSinceFriday = (weekday - 5 + 7) % 7;
@@ -414,11 +441,11 @@ void computeShabbatTimes() {
   for (int attempt = 0; attempt < 2; attempt++) {
     int fy, fm, fd;
     civilFromDays(fridayDays, fy, fm, fd);
-    time_t fridaySunset = sunsetEpochFor(fy, fm, fd, latitude, longitude);
+    time_t fridaySunset = sunsetEpochFor(fy, fm, fd, latitude, longitude) + solarEpochShift;
 
     int sy, sm, sd;
     civilFromDays(fridayDays + 1, sy, sm, sd);
-    time_t satSunset = sunsetEpochFor(sy, sm, sd, latitude, longitude);
+    time_t satSunset = sunsetEpochFor(sy, sm, sd, latitude, longitude) + solarEpochShift;
 
     time_t candidateCandle = fridaySunset - (time_t)CANDLE_LIGHTING_MINUTES * 60;
     time_t candidateHavdalah = satSunset + (time_t)havdalahOffsetMin * 60;
@@ -668,6 +695,7 @@ void saveWifiCreds(const String &ssid, const String &pass) {
   currentPass = pass;
   hasWifiCreds = currentSsid.length() > 0;
   hasWallClock = attemptNtpSync(15000, 8000);
+  clockIsLocalLabeled = false; // NTP-synced clock is true UTC
   lastNtpAttemptMs = millis();
   if (hasWallClock) {
     fetchTimezoneFromIP();
@@ -1088,20 +1116,26 @@ void handleNumEntryButtons() {
         tmpMinute = numValue;
         if (hasWifiCreds) {
           // Online path: derive the local UTC offset by comparing the
-          // entered local time against the NTP-verified system clock.
+          // entered local time against the NTP-verified (true UTC) system clock.
           time_t enteredLocalEpoch = utcToEpoch(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute, 0);
           time_t nowUtc = time(nullptr);
           localUtcOffsetSeconds = (long)(enteredLocalEpoch - nowUtc);
           saveUtcOffset();
+          clockIsLocalLabeled = false;
         } else {
           // Offline path: no NTP reference exists at all, so set the
           // system clock directly to the entered LOCAL time and keep the
           // offset at 0 — a self-consistent epoch+offset pair is all
-          // formatLocalTime()/computeShabbatTimes() need.
+          // formatLocalTime() needs. computeShabbatTimes() is told about
+          // this via clockIsLocalLabeled, so its solar calculation (which
+          // always works in true UTC) gets shifted back into this same
+          // local-labeled epoch space instead of coming out several hours
+          // wrong.
           setSystemTimeManually(tmpYear, tmpMonth, tmpDay, tmpHour, tmpMinute);
           localUtcOffsetSeconds = 0;
           saveUtcOffset();
           hasWallClock = true;
+          clockIsLocalLabeled = true;
         }
         if (hasCoords) computeShabbatTimes();
         if (firstRunActive) {
@@ -1188,6 +1222,7 @@ void performSystemReset() {
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
   hasWallClock = false;
+  clockIsLocalLabeled = false;
   needsGeocode = false;
   screenNeedsFullRedraw = true;
 
@@ -1456,6 +1491,11 @@ void setup() {
   } else {
     hasWallClock = false;
   }
+  // Every boot starts here with a fresh (NTP or none) clock — the offline
+  // manually-set clock doesn't survive a reboot (no RTC backup), so it's
+  // never still "local-labeled" at this point; that flag only gets set
+  // again if the user re-runs the offline SET TIME flow this session.
+  clockIsLocalLabeled = false;
   lastNtpAttemptMs = millis();
 
   if (hasWallClock) {
@@ -1491,6 +1531,7 @@ void loop() {
         bool hadWallClock = hasWallClock;
         if (attemptNtpSync(6000, 5000)) {
           hasWallClock = true;
+          clockIsLocalLabeled = false; // NTP-synced clock is true UTC
           fetchTimezoneFromIP();
           if (!hadWallClock) {
             if (!hasCoords) needsGeocode = true;
