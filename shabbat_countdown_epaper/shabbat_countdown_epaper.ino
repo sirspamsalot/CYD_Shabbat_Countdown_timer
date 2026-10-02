@@ -52,60 +52,51 @@
                      step). If your unit's rotary knob instead needs true
                      quadrature decoding to feel right (missed/doubled
                      steps when turning), that's the thing to revisit.
-    Library:        GxEPD2 (by Jean-Marc Zingg), display class
-                     GxEPD2_420_GDEY042T81 (src/gdey/ subfolder) — but see
-                     "RESOLVED: Busy Timeout!" below: this sketch now uses a
-                     vendored, software-SPI-capable copy of that class
-                     (GxEPD2_420_GDEY042T81_SW), not the stock one. An
-                     earlier version of this sketch referenced
-                     GxEPD2_420_GYE042A87, which several third-party
-                     CrowPanel write-ups (including Elecrow's own wiki text)
-                     cite but which was never actually merged into the
-                     GxEPD2 library (only discussed/donated on the GxEPD2
-                     forum, never shipped) — fails to compile ("fatal
-                     error: ... No such file or directory"). GDEY042T81 is
-                     the SSD1683/400x300 4.2" driver that IS actually in the
-                     library, and it's also what the manufacturer's own
-                     reference write-up (mischianti.org's CrowPanel
-                     ESP32-S3 4.2" article, which mirrors Elecrow's example)
-                     uses in practice — same pins (CS=45 DC=46 RST=47
-                     BUSY=48 PWR=7, SCLK=12 MOSI=11, all confirmed against
-                     that reference and against Elecrow's own official
-                     example code). BUSY is standard HIGH=busy/LOW=ready,
-                     the GxEPD2 library's own default — not inverted.
+    Display driver: NOT the GxEPD2 library. See "RESOLVED: Busy Timeout!"
+                     below — this board's e-paper controller needs an older
+                     register convention that GxEPD2's generic driver for
+                     this panel never sends, so this sketch instead draws
+                     onto a plain Adafruit_GFX canvas (GFXcanvas1) and pushes
+                     the finished buffer to the panel using CrowpanelEPD.h/
+                     .cpp, a vendored port of Elecrow's own proven-working
+                     driver code (same pins as below, confirmed against both
+                     Elecrow's official example and the earlier GxEPD2-based
+                     attempts: CS=45 DC=46 RST=47 BUSY=48 PWR=7, SCLK=12
+                     MOSI=11). BUSY is standard HIGH=busy/LOW=ready.
 
   IMPORTANT — hardware assumptions flagged for on-device verification,
   same spirit as the CYD sketch's notes: I could not compile-test this
-  file against real hardware or the GxEPD2 library from this environment.
+  file against real hardware from this environment.
   Things most likely to need a tweak on your actual unit:
     - Button polarity: assumed active-LOW with internal pull-ups. If
       presses register backwards (or never register), flip BTN_ACTIVE_LOW
       below.
-    - BUSY pin polarity: standard HIGH=busy/LOW=ready (the GxEPD2 library's
-      own default for this driver class) — NOT inverted.
-    - Screen rotation: display.setRotation(1) is a starting guess for
-      landscape. Try 0/2/3 if the image is sideways or mirrored.
-    - This sketch now talks to the panel over bit-banged ("software") SPI
-      instead of the ESP32 hardware SPI peripheral — see "RESOLVED: Busy
-      Timeout!" below for why. If you still see "Busy Timeout!" after this
-      change, that would be the first real evidence of an actual
-      board/panel/cable fault, since every software-side explanation found
-      so far has now been ruled out or fixed.
+    - BUSY pin polarity: standard HIGH=busy/LOW=ready — NOT inverted.
+    - This sketch draws at the panel's native 400x300 orientation with no
+      rotation applied (no equivalent of GxEPD2's setRotation() is used
+      anymore — see "RESOLVED: Busy Timeout!" below). If the image comes
+      out sideways or mirrored on your unit, that's the thing to revisit —
+      most likely in how CrowpanelEPD.cpp writes buffer bytes, not in the
+      drawing code itself.
+    - If "Busy Timeout!" still happens with this version, that would be the
+      first real evidence of an actual board/panel/cable fault, since every
+      software-side explanation found so far (hardware SPI vs. bit-banged
+      SPI, and now the register/command convention itself) has been tried.
 
   BEFORE YOU FLASH:
   1. No Wi-Fi credentials to set here at all — flash as-is, then from the
      device: MENU > (rotary down to) WI-FI > OK. Connect your phone to the
      "ShabbatClock-Setup" Wi-Fi network it starts, open http://192.168.4.1,
      enter your real network's name/password, submit.
-  2. Libraries (Arduino Library Manager): "GxEPD2", "Adafruit GFX Library",
-     "ArduinoJson". WiFi, HTTPClient, WebServer, DNSServer, Preferences,
-     SPI ship with the ESP32 core. Also keep GxEPD2_EPD_SW.h/.cpp and
-     GxEPD2_420_GDEY042T81_SW.h/.cpp in the SAME FOLDER as this .ino —
-     they're a vendored, software-SPI-capable copy of two GxEPD2 classes
-     (see those files, and "RESOLVED: Busy Timeout!" below, for why) and
-     the sketch won't compile without them sitting right alongside it.
-  3. Board: "ESP32S3 Dev Module". Flash size 8MB, PSRAM enabled (required —
-     the full-buffer GxEPD2 mode needs it), default partition scheme.
+  2. Libraries (Arduino Library Manager): "Adafruit GFX Library",
+     "ArduinoJson". WiFi, HTTPClient, WebServer, DNSServer, Preferences
+     ship with the ESP32 core. GxEPD2 is NOT needed anymore. Also keep
+     CrowpanelEPD.h and CrowpanelEPD.cpp in the SAME FOLDER as this .ino —
+     they're the vendored e-paper driver (see those files, and "RESOLVED:
+     Busy Timeout!" below, for why) and the sketch won't compile without
+     them sitting right alongside it.
+  3. Board: "ESP32S3 Dev Module". Flash size 8MB, PSRAM enabled, default
+     partition scheme.
 
   ======================================================================
   RESOLVED: "Busy Timeout!" / screen never updates — full history, so a
@@ -129,29 +120,43 @@
   in setup() was suspected next, then also ruled out (simplifying it to a
   single reset did not fix the issue).
 
-  ROOT CAUSE, finally confirmed: neither panel nor board. Elecrow's own
-  official example sketch for this exact board (4.2_Example3_PWR, from
+  First real lead: Elecrow's own official example sketch for this exact
+  board (4.2_Example3_PWR, from
   https://github.com/Elecrow-RD/CrowPanel-ESP32-4.2-E-paper-HMI-Display-with-400-300)
   was flashed onto this same "faulty" unit and successfully updated the
-  display. Reading that example's driver code (EPD_SPI.cpp) line by line
-  against this sketch's pins, reset timing, and init sequence found them
-  all identical — with exactly one difference: that example drives SCLK/
-  MOSI with plain digitalWrite() calls in a loop ("software"/bit-banged
-  SPI), never touching the ESP32's hardware SPI peripheral at all, while
-  this sketch (via the stock GxEPD2 library) used that hardware SPI
-  peripheral exclusively. Switching this sketch to bit-banged SPI — using
-  GxEPD2's own official software-SPI variant of its base class, vendored
-  into this sketch as GxEPD2_EPD_SW / GxEPD2_420_GDEY042T81_SW — is the
-  fix now in place below. (One side note from reading that same example:
-  the red LED that was tracked during debugging as if it might indicate
-  EPD_PWR/GPIO7 health is actually wired to a completely separate pin,
-  GPIO41, labeled "POWER indicator light" in Elecrow's own code — it has
-  no connection to the display's power rail or SPI, so its behavior during
-  earlier debugging wasn't actually diagnostic of anything display-related.)
+  screen — ruling out a hardware defect entirely. Comparing that example's
+  driver code against this sketch found one difference: it drives SCLK/
+  MOSI with plain digitalWrite() calls ("software"/bit-banged SPI), never
+  touching the ESP32's hardware SPI peripheral, while this sketch (via the
+  stock GxEPD2 library) used that peripheral exclusively. Switching to
+  bit-banged SPI via GxEPD2's own official software-SPI variant of its base
+  class was tried next — and STILL timed out, with the exact same symptom.
 
-  If "Busy Timeout!" still happens with this software-SPI version, that
-  would be the first real board/panel/cable-level evidence, since every
-  software explanation that could be found has now been tried.
+  ROOT CAUSE, finally confirmed: the SPI transport was never the real
+  problem — the REGISTERS were. Reading Elecrow's EPD.cpp line by line
+  (not just EPD_SPI.cpp) turned up the actual mismatch: this controller
+  needs an older register convention — init via commands 0x00, 0x01, 0x06,
+  0x30, 0x61, 0x82, 0x50, 0x60, 0xE3; the image written to register 0x13;
+  the refresh triggered by 0x17/0xA5 — that the stock GxEPD2 driver for
+  this panel (GxEPD2_420_GDEY042T81) never sends at all. That driver
+  assumes a different, newer command set (0x24/0x26 for the image, 0x20 to
+  trigger refresh) belonging to a different controller generation. No
+  amount of fixing the SPI transport was ever going to paper over a
+  completely different command vocabulary. The fix: this sketch no longer
+  uses GxEPD2 for the e-paper panel at all. CrowpanelEPD.h/.cpp is a direct,
+  trimmed port of Elecrow's own EPD.cpp/EPD_SPI.cpp — the exact sequence
+  proven to work on this hardware — and all drawing happens on a plain
+  Adafruit_GFX GFXcanvas1 buffer that gets pushed through it. See
+  CrowpanelEPD.h for more detail, including a note on a faster "partial
+  refresh" LUT that exists in the controller but is intentionally NOT used
+  yet, since Elecrow's own demo never exercises it either.
+
+  (One side note from reading Elecrow's example: the red LED that was
+  tracked during debugging as if it might indicate EPD_PWR/GPIO7 health is
+  actually wired to a completely separate pin, GPIO41, labeled "POWER
+  indicator light" in Elecrow's own code — it has no connection to the
+  display's power rail or SPI, so its behavior during earlier debugging
+  wasn't actually diagnostic of anything display-related.)
   ======================================================================
 */
 
@@ -161,9 +166,8 @@
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <SPI.h>
-#include <GxEPD2_BW.h>
-#include "GxEPD2_420_GDEY042T81_SW.h" // vendored sw-spi panel driver — see that file for why
+#include <Adafruit_GFX.h>
+#include "CrowpanelEPD.h" // vendored panel driver, ported from Elecrow's own working example — see that file for why
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
@@ -204,9 +208,12 @@ const int DEFAULT_HAVDALAH_OFFSET_MIN = 42;  // "3 medium stars" — adjustable 
 #define BTN_ACTIVE_LOW 1   // flip to 0 if your unit reads the opposite way
 // ------------------------------------------------
 
-GxEPD2_BW<GxEPD2_420_GDEY042T81_SW, GxEPD2_420_GDEY042T81_SW::HEIGHT> display(
-  GxEPD2_420_GDEY042T81_SW(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
-);
+// In-memory 1-bit canvas — all drawing happens here (Adafruit_GFX calls),
+// and CrowpanelEPD.cpp's crowEpdDisplay() pushes the finished buffer to the
+// physical panel. Bit convention: 1 = white, 0 = black (see CrowpanelEPD.h).
+GFXcanvas1 canvas(400, 300);
+#define EPD_WHITE 1
+#define EPD_BLACK 0
 
 Preferences prefs;
 DNSServer dnsServer;
@@ -681,7 +688,7 @@ void saveZipAndTriggerGeocode(const String &zip) {
 }
 
 // =========================================================================
-// Drawing helpers (monochrome — GxEPD_BLACK / GxEPD_WHITE only)
+// Drawing helpers (monochrome — EPD_BLACK / EPD_WHITE only)
 // =========================================================================
 const GFXfont* chromeFont(uint8_t size) {
   switch (size) {
@@ -693,33 +700,30 @@ const GFXfont* chromeFont(uint8_t size) {
 }
 
 void printCentered(const char* txt, int cx, int y, uint8_t size, uint16_t fg, uint16_t bg) {
-  display.setFont(chromeFont(size));
-  display.setTextSize(1);
-  display.setTextColor(fg, bg);
+  canvas.setFont(chromeFont(size));
+  canvas.setTextSize(1);
+  canvas.setTextColor(fg, bg);
   int16_t bx, by; uint16_t bw, bh;
-  display.getTextBounds(txt, 0, 0, &bx, &by, &bw, &bh);
-  display.setCursor(cx - bw / 2 - bx, y - by);
-  display.print(txt);
-  display.setFont();
+  canvas.getTextBounds(txt, 0, 0, &bx, &by, &bw, &bh);
+  canvas.setCursor(cx - bw / 2 - bx, y - by);
+  canvas.print(txt);
+  canvas.setFont();
 }
 
 void drawCandleIcon(int x, int y, uint16_t color) {
-  display.fillRect(x, y + 6, 6, 14, color);
-  display.fillRect(x - 1, y + 4, 8, 2, color);
-  display.fillTriangle(x + 3, y - 6, x, y + 4, x + 6, y + 4, color);
+  canvas.fillRect(x, y + 6, 6, 14, color);
+  canvas.fillRect(x - 1, y + 4, 8, 2, color);
+  canvas.fillTriangle(x + 3, y - 6, x, y + 4, x + 6, y + 4, color);
 }
 
-// One full-buffer refresh pass: clears to white, calls the given content
-// function to draw everything, then pushes the whole panel. Used for every
-// screen except the once-a-minute clock tick (which uses a faster partial
-// refresh — see partialRefreshClock()).
+// One full-buffer refresh pass: clears the in-memory canvas to white, calls
+// the given content function to draw everything onto it, then pushes the
+// whole 400x300 buffer to the panel via CrowpanelEPD (see that file for why
+// this is a full push rather than a true hardware partial refresh).
 void fullRefreshGeneric(void (*drawFn)()) {
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    drawFn();
-  } while (display.nextPage());
+  canvas.fillScreen(EPD_WHITE);
+  drawFn();
+  crowEpdDisplay(canvas.getBuffer());
 }
 
 // =========================================================================
@@ -730,27 +734,27 @@ void fullRefreshGeneric(void (*drawFn)()) {
 #define SCREEN_H 300
 
 void drawHeader() {
-  display.fillRect(0, 0, SCREEN_W, HEADER_H, GxEPD_BLACK);
-  drawCandleIcon(10, 16, GxEPD_WHITE);
-  drawCandleIcon(22, 16, GxEPD_WHITE);
+  canvas.fillRect(0, 0, SCREEN_W, HEADER_H, EPD_BLACK);
+  drawCandleIcon(10, 16, EPD_WHITE);
+  drawCandleIcon(22, 16, EPD_WHITE);
 
   String zipText = usingCity ? currentCityLabel : ("ZIP " + currentZip);
-  display.setFont(&FreeSansBold9pt7b);
-  display.setTextSize(1);
-  display.setTextColor(GxEPD_WHITE, GxEPD_BLACK);
+  canvas.setFont(&FreeSansBold9pt7b);
+  canvas.setTextSize(1);
+  canvas.setTextColor(EPD_WHITE, EPD_BLACK);
   int16_t zbx, zby; uint16_t zbw, zbh;
-  display.getTextBounds(zipText.c_str(), 0, 0, &zbx, &zby, &zbw, &zbh);
-  display.setCursor(42 - zbx, 11 - zby);
-  display.print(zipText);
+  canvas.getTextBounds(zipText.c_str(), 0, 0, &zbx, &zby, &zbw, &zbh);
+  canvas.setCursor(42 - zbx, 11 - zby);
+  canvas.print(zipText);
 
   if (hasWallClock) {
     String t = formatLocalTime(time(nullptr));
     int16_t tbx, tby; uint16_t tbw, tbh;
-    display.getTextBounds(t.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
-    display.setCursor(392 - tbw - tbx, 11 - tby);
-    display.print(t);
+    canvas.getTextBounds(t.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+    canvas.setCursor(392 - tbw - tbx, 11 - tby);
+    canvas.print(t);
   }
-  display.setFont();
+  canvas.setFont();
 }
 
 // Builds the two countdown strings ("3 DAYS" / "14 HR 22 MIN") from the
@@ -774,10 +778,10 @@ void countdownStrings(String &lineTop, String &lineBottom) {
 }
 
 void drawCountdownArea() {
-  printCentered("TIME REMAINING", 200, 42, 3, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("TIME REMAINING", 200, 42, 3, EPD_BLACK, EPD_WHITE);
 
   const int fx0 = 40, fy0 = 74, fx1 = 360, fy1 = 170;
-  display.drawRoundRect(fx0, fy0, fx1 - fx0, fy1 - fy0, 8, GxEPD_BLACK);
+  canvas.drawRoundRect(fx0, fy0, fx1 - fx0, fy1 - fy0, 8, EPD_BLACK);
 
   // Unified gating: !hasWallClock covers both "never synced" (online path)
   // AND "never manually set" (offline path) in one check, since either one
@@ -786,19 +790,19 @@ void drawCountdownArea() {
   // Wi-Fi nag once its clock has been set.
   if (!hasWallClock) {
     if (hasWifiCreds) {
-      printCentered("SYNCING TIME...", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
-      printCentered("(waiting on Wi-Fi/NTP)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
+      printCentered("SYNCING TIME...", 200, 105, 2, EPD_BLACK, EPD_WHITE);
+      printCentered("(waiting on Wi-Fi/NTP)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
     } else {
-      printCentered("SET UP WI-FI OR SET TIME", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
-      printCentered("(MENU > Settings)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
+      printCentered("SET UP WI-FI OR SET TIME", 200, 105, 2, EPD_BLACK, EPD_WHITE);
+      printCentered("(MENU > Settings)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
     }
   } else if (!hasCoords) {
-    printCentered("NO LOCATION SET", 200, 105, 2, GxEPD_BLACK, GxEPD_WHITE);
-    printCentered("(MENU > Settings)", 200, 132, 1, GxEPD_BLACK, GxEPD_WHITE);
+    printCentered("NO LOCATION SET", 200, 105, 2, EPD_BLACK, EPD_WHITE);
+    printCentered("(MENU > Settings)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
   } else if (needsGeocode) {
-    printCentered("LOCATING...", 200, 112, 2, GxEPD_BLACK, GxEPD_WHITE);
+    printCentered("LOCATING...", 200, 112, 2, EPD_BLACK, EPD_WHITE);
   } else if (candleLightingEpoch == 0 || havdalahEpoch == 0) {
-    printCentered("CALCULATING...", 200, 112, 2, GxEPD_BLACK, GxEPD_WHITE);
+    printCentered("CALCULATING...", 200, 112, 2, EPD_BLACK, EPD_WHITE);
   } else {
     String lineTop, lineBottom;
     countdownStrings(lineTop, lineBottom);
@@ -808,8 +812,8 @@ void drawCountdownArea() {
     int lineH1 = 32, lineH2 = 24, gap = 6; // approx text heights at size 4 / size 3
     int blockH = lineH1 + lineH2 + gap;
     int blockTop = fy0 + (frameH - blockH) / 2;
-    printCentered(lineTop.c_str(), 200, blockTop, 4, GxEPD_BLACK, GxEPD_WHITE);
-    printCentered(lineBottom.c_str(), 200, blockTop + lineH1 + gap, 3, GxEPD_BLACK, GxEPD_WHITE);
+    printCentered(lineTop.c_str(), 200, blockTop, 4, EPD_BLACK, EPD_WHITE);
+    printCentered(lineBottom.c_str(), 200, blockTop + lineH1 + gap, 3, EPD_BLACK, EPD_WHITE);
   }
 
   if (hasWallClock && !needsGeocode && candleLightingEpoch != 0 && havdalahEpoch != 0) {
@@ -824,13 +828,13 @@ void drawCountdownArea() {
     int blockH = lineH * 2 + gap;
     int blockTop = areaTop + (areaHeight - blockH) / 2;
 
-    printCentered(candleLine.c_str(), 200, blockTop, 2, GxEPD_BLACK, GxEPD_WHITE);
-    printCentered(havdalahLine.c_str(), 200, blockTop + lineH + gap, 2, GxEPD_BLACK, GxEPD_WHITE);
+    printCentered(candleLine.c_str(), 200, blockTop, 2, EPD_BLACK, EPD_WHITE);
+    printCentered(havdalahLine.c_str(), 200, blockTop + lineH + gap, 2, EPD_BLACK, EPD_WHITE);
   }
 }
 
 void drawFooterHint() {
-  printCentered("MENU: Settings", 200, 282, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("MENU: Settings", 200, 282, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void clockFullContent() {
@@ -840,7 +844,7 @@ void clockFullContent() {
 }
 
 void clockPartialContent() {
-  display.fillRect(0, 0, SCREEN_W, 270, GxEPD_WHITE);
+  canvas.fillRect(0, 0, SCREEN_W, 270, EPD_WHITE);
   drawHeader();
   drawCountdownArea();
 }
@@ -851,20 +855,22 @@ void fullRefreshClock() {
 }
 
 void partialRefreshClock() {
-  display.setPartialWindow(0, 0, SCREEN_W, 270);
-  display.firstPage();
-  do {
-    clockPartialContent();
-  } while (display.nextPage());
+  // "Partial" here is about which part of the in-memory canvas got redrawn
+  // (clockPartialContent() only clears/redraws the top ~270px, leaving the
+  // footer hint alone) — the push to the panel itself is still a full
+  // 400x300 refresh, same as fullRefreshGeneric(). See CrowpanelEPD.h for
+  // why a true hardware partial refresh isn't used (yet).
+  clockPartialContent();
+  crowEpdDisplay(canvas.getBuffer());
 }
 
 // ---------------- One-off status screens (locating/failed), full refresh ----------------
-void locatingContent() { printCentered("LOCATING...", 200, 130, 2, GxEPD_BLACK, GxEPD_WHITE); }
+void locatingContent() { printCentered("LOCATING...", 200, 130, 2, EPD_BLACK, EPD_WHITE); }
 void zipFailContent() {
-  printCentered("ZIP LOOKUP FAILED", 200, 120, 2, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("Check ZIP in Settings & retry", 200, 150, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("ZIP LOOKUP FAILED", 200, 120, 2, EPD_BLACK, EPD_WHITE);
+  printCentered("Check ZIP in Settings & retry", 200, 150, 1, EPD_BLACK, EPD_WHITE);
 }
-void connectingContent() { printCentered("CONNECTING TO WI-FI...", 200, 130, 2, GxEPD_BLACK, GxEPD_WHITE); }
+void connectingContent() { printCentered("CONNECTING TO WI-FI...", 200, 130, 2, EPD_BLACK, EPD_WHITE); }
 
 void doGeocode() {
   fullRefreshGeneric(locatingContent);
@@ -903,8 +909,8 @@ void updateCountdown() {
 // Screen: settings menu (UP/DOWN to move, OK to select, EXIT to go back)
 // =========================================================================
 void settingsContent() {
-  display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
-  printCentered("SETTINGS", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
+  canvas.fillRect(0, 0, SCREEN_W, 26, EPD_BLACK);
+  printCentered("SETTINGS", 200, 4, 1, EPD_WHITE, EPD_BLACK);
 
   // ZIP CODE and CITY render as two side-by-side half-width boxes in one
   // row — a visual cue that they're alternatives, not two separate
@@ -916,25 +922,25 @@ void settingsContent() {
   const int top = 30, rowH = 30, rowStep = 40;
 
   bool selZip = (settingsCursor == 0);
-  if (selZip) display.fillRoundRect(20, top, 175, rowH, 6, GxEPD_BLACK);
-  else display.drawRoundRect(20, top, 175, rowH, 6, GxEPD_BLACK);
-  printCentered("ZIP CODE", 107, top + 6, 2, selZip ? GxEPD_WHITE : GxEPD_BLACK, selZip ? GxEPD_BLACK : GxEPD_WHITE);
+  if (selZip) canvas.fillRoundRect(20, top, 175, rowH, 6, EPD_BLACK);
+  else canvas.drawRoundRect(20, top, 175, rowH, 6, EPD_BLACK);
+  printCentered("ZIP CODE", 107, top + 6, 2, selZip ? EPD_WHITE : EPD_BLACK, selZip ? EPD_BLACK : EPD_WHITE);
 
   bool selCity = (settingsCursor == 1);
-  if (selCity) display.fillRoundRect(205, top, 175, rowH, 6, GxEPD_BLACK);
-  else display.drawRoundRect(205, top, 175, rowH, 6, GxEPD_BLACK);
-  printCentered("CITY", 292, top + 6, 2, selCity ? GxEPD_WHITE : GxEPD_BLACK, selCity ? GxEPD_BLACK : GxEPD_WHITE);
+  if (selCity) canvas.fillRoundRect(205, top, 175, rowH, 6, EPD_BLACK);
+  else canvas.drawRoundRect(205, top, 175, rowH, 6, EPD_BLACK);
+  printCentered("CITY", 292, top + 6, 2, selCity ? EPD_WHITE : EPD_BLACK, selCity ? EPD_BLACK : EPD_WHITE);
 
   for (int i = 2; i < 7; i++) {
     int y = top + (i - 1) * rowStep;
     bool selected = (i == settingsCursor);
-    uint16_t fg = selected ? GxEPD_WHITE : GxEPD_BLACK;
-    uint16_t bg = selected ? GxEPD_BLACK : GxEPD_WHITE;
-    if (selected) display.fillRoundRect(30, y, 340, rowH, 6, GxEPD_BLACK);
-    else display.drawRoundRect(30, y, 340, rowH, 6, GxEPD_BLACK);
+    uint16_t fg = selected ? EPD_WHITE : EPD_BLACK;
+    uint16_t bg = selected ? EPD_BLACK : EPD_WHITE;
+    if (selected) canvas.fillRoundRect(30, y, 340, rowH, 6, EPD_BLACK);
+    else canvas.drawRoundRect(30, y, 340, rowH, 6, EPD_BLACK);
     printCentered(SETTINGS_LABELS[i], 200, y + 6, 2, fg, bg);
   }
-  printCentered("UP/DOWN move   OK select   EXIT back", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("UP/DOWN move   OK select   EXIT back", 200, 286, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void drawSettingsScreen() { fullRefreshGeneric(settingsContent); }
@@ -949,18 +955,18 @@ void startZipEntry() {
 }
 
 void zipEntryContent() {
-  printCentered("ENTER ZIP CODE", 200, 20, 2, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("ENTER ZIP CODE", 200, 20, 2, EPD_BLACK, EPD_WHITE);
   int boxW = 44, boxGap = 10;
   int startX = 200 - (5 * boxW + 4 * boxGap) / 2;
   for (int i = 0; i < 5; i++) {
     int bx = startX + i * (boxW + boxGap);
     bool sel = (i == zipCursor);
-    if (sel) display.fillRoundRect(bx, 90, boxW, 60, 6, GxEPD_BLACK);
-    else display.drawRoundRect(bx, 90, boxW, 60, 6, GxEPD_BLACK);
+    if (sel) canvas.fillRoundRect(bx, 90, boxW, 60, 6, EPD_BLACK);
+    else canvas.drawRoundRect(bx, 90, boxW, 60, 6, EPD_BLACK);
     char c[2] = { (char)('0' + zipDigits[i]), 0 };
-    printCentered(c, bx + boxW / 2, 108, 3, sel ? GxEPD_WHITE : GxEPD_BLACK, sel ? GxEPD_BLACK : GxEPD_WHITE);
+    printCentered(c, bx + boxW / 2, 108, 3, sel ? EPD_WHITE : EPD_BLACK, sel ? EPD_BLACK : EPD_WHITE);
   }
-  printCentered("UP/DOWN change digit   OK next   EXIT cancel", 200, 250, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("UP/DOWN change digit   OK next   EXIT cancel", 200, 250, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void drawZipEntryScreen() { fullRefreshGeneric(zipEntryContent); }
@@ -994,12 +1000,12 @@ void startNumEntry(NumEntryPurpose p, const String &title, int value, int mn, in
 }
 
 void numEntryContent() {
-  printCentered(numTitle.c_str(), 200, 30, 2, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered(numTitle.c_str(), 200, 30, 2, EPD_BLACK, EPD_WHITE);
   char buf[16];
   snprintf(buf, sizeof(buf), "%d", numValue);
-  display.drawRoundRect(120, 90, 160, 70, 10, GxEPD_BLACK);
-  printCentered(buf, 200, 108, 4, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("UP/DOWN change   OK confirm   EXIT cancel", 200, 250, 1, GxEPD_BLACK, GxEPD_WHITE);
+  canvas.drawRoundRect(120, 90, 160, 70, 10, EPD_BLACK);
+  printCentered(buf, 200, 108, 4, EPD_BLACK, EPD_WHITE);
+  printCentered("UP/DOWN change   OK confirm   EXIT cancel", 200, 250, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void drawNumEntryScreen() { fullRefreshGeneric(numEntryContent); }
@@ -1135,24 +1141,24 @@ void handleSettingsButtons() {
 // confirms the highlighted choice, EXIT cancels outright.
 // =========================================================================
 void confirmResetContent() {
-  display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
-  printCentered("SYSTEM RESET", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
+  canvas.fillRect(0, 0, SCREEN_W, 26, EPD_BLACK);
+  printCentered("SYSTEM RESET", 200, 4, 1, EPD_WHITE, EPD_BLACK);
 
-  printCentered("ARE YOU SURE?", 200, 50, 2, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("erases wifi, location, time", 200, 90, 1, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("and all settings", 200, 108, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("ARE YOU SURE?", 200, 50, 2, EPD_BLACK, EPD_WHITE);
+  printCentered("erases wifi, location, time", 200, 90, 1, EPD_BLACK, EPD_WHITE);
+  printCentered("and all settings", 200, 108, 1, EPD_BLACK, EPD_WHITE);
 
   bool selYes = (confirmResetCursor == 0);
-  if (selYes) display.fillRoundRect(60, 160, 140, 60, 8, GxEPD_BLACK);
-  else display.drawRoundRect(60, 160, 140, 60, 8, GxEPD_BLACK);
-  printCentered("YES, RESET", 130, 182, 1, selYes ? GxEPD_WHITE : GxEPD_BLACK, selYes ? GxEPD_BLACK : GxEPD_WHITE);
+  if (selYes) canvas.fillRoundRect(60, 160, 140, 60, 8, EPD_BLACK);
+  else canvas.drawRoundRect(60, 160, 140, 60, 8, EPD_BLACK);
+  printCentered("YES, RESET", 130, 182, 1, selYes ? EPD_WHITE : EPD_BLACK, selYes ? EPD_BLACK : EPD_WHITE);
 
   bool selNo = (confirmResetCursor == 1);
-  if (selNo) display.fillRoundRect(220, 160, 140, 60, 8, GxEPD_BLACK);
-  else display.drawRoundRect(220, 160, 140, 60, 8, GxEPD_BLACK);
-  printCentered("CANCEL", 290, 182, 1, selNo ? GxEPD_WHITE : GxEPD_BLACK, selNo ? GxEPD_BLACK : GxEPD_WHITE);
+  if (selNo) canvas.fillRoundRect(220, 160, 140, 60, 8, EPD_BLACK);
+  else canvas.drawRoundRect(220, 160, 140, 60, 8, EPD_BLACK);
+  printCentered("CANCEL", 290, 182, 1, selNo ? EPD_WHITE : EPD_BLACK, selNo ? EPD_BLACK : EPD_WHITE);
 
-  printCentered("UP/DOWN choose   OK confirm   EXIT cancel", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("UP/DOWN choose   OK confirm   EXIT cancel", 200, 286, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void drawConfirmResetScreen() { fullRefreshGeneric(confirmResetContent); }
@@ -1217,19 +1223,19 @@ void handleConfirmResetButtons() {
 #define CITY_ROW_H 30
 
 void cityListContent() {
-  display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
-  printCentered("SELECT CITY", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
+  canvas.fillRect(0, 0, SCREEN_W, 26, EPD_BLACK);
+  printCentered("SELECT CITY", 200, 4, 1, EPD_WHITE, EPD_BLACK);
 
   for (int i = 0; i < CITY_ROWS_VISIBLE; i++) {
     int idx = cityListTop + i;
     if (idx >= CITY_COUNT) break;
     int y = 30 + i * CITY_ROW_H;
     bool sel = (i == cityListCursor);
-    if (sel) display.fillRoundRect(20, y, 360, CITY_ROW_H - 3, 5, GxEPD_BLACK);
-    else display.drawRoundRect(20, y, 360, CITY_ROW_H - 3, 5, GxEPD_BLACK);
-    printCentered(CITY_LIST[idx].name, 200, y + 6, 1, sel ? GxEPD_WHITE : GxEPD_BLACK, sel ? GxEPD_BLACK : GxEPD_WHITE);
+    if (sel) canvas.fillRoundRect(20, y, 360, CITY_ROW_H - 3, 5, EPD_BLACK);
+    else canvas.drawRoundRect(20, y, 360, CITY_ROW_H - 3, 5, EPD_BLACK);
+    printCentered(CITY_LIST[idx].name, 200, y + 6, 1, sel ? EPD_WHITE : EPD_BLACK, sel ? EPD_BLACK : EPD_WHITE);
   }
-  printCentered("UP/DOWN scroll   OK select   EXIT back", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("UP/DOWN scroll   OK select   EXIT back", 200, 286, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void drawCityListScreen() { fullRefreshGeneric(cityListContent); }
@@ -1262,13 +1268,13 @@ void handleCityListButtons() {
 // instead of an on-device keyboard (see the header comment for why).
 // =========================================================================
 void wifiSetupContent() {
-  printCentered("WI-FI SETUP", 200, 20, 2, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("1. On your phone, join Wi-Fi network:", 200, 70, 1, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("ShabbatClock-Setup", 200, 92, 3, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("2. Open a browser to:", 200, 150, 1, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("http://192.168.4.1", 200, 172, 3, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("3. Enter your real network's name & password", 200, 226, 1, GxEPD_BLACK, GxEPD_WHITE);
-  printCentered("Press EXIT to cancel", 200, 250, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("WI-FI SETUP", 200, 20, 2, EPD_BLACK, EPD_WHITE);
+  printCentered("1. On your phone, join Wi-Fi network:", 200, 70, 1, EPD_BLACK, EPD_WHITE);
+  printCentered("ShabbatClock-Setup", 200, 92, 3, EPD_BLACK, EPD_WHITE);
+  printCentered("2. Open a browser to:", 200, 150, 1, EPD_BLACK, EPD_WHITE);
+  printCentered("http://192.168.4.1", 200, 172, 3, EPD_BLACK, EPD_WHITE);
+  printCentered("3. Enter your real network's name & password", 200, 226, 1, EPD_BLACK, EPD_WHITE);
+  printCentered("Press EXIT to cancel", 200, 250, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void handlePortalRoot() {
@@ -1348,22 +1354,22 @@ void handleWifiSetupLoop() {
 // UP/DOWN toggles which of the two options is highlighted, OK selects it.
 // =========================================================================
 void firstRunContent() {
-  display.fillRect(0, 0, SCREEN_W, 26, GxEPD_BLACK);
-  printCentered("WELCOME - SET UP CLOCK", 200, 4, 1, GxEPD_WHITE, GxEPD_BLACK);
+  canvas.fillRect(0, 0, SCREEN_W, 26, EPD_BLACK);
+  printCentered("WELCOME - SET UP CLOCK", 200, 4, 1, EPD_WHITE, EPD_BLACK);
 
   bool sel0 = (firstRunCursor == 0);
-  if (sel0) display.fillRoundRect(40, 50, 320, 90, 10, GxEPD_BLACK);
-  else display.drawRoundRect(40, 50, 320, 90, 10, GxEPD_BLACK);
-  printCentered("CONNECT TO WI-FI", 200, 75, 2, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
-  printCentered("auto time, set location after", 200, 108, 1, sel0 ? GxEPD_WHITE : GxEPD_BLACK, sel0 ? GxEPD_BLACK : GxEPD_WHITE);
+  if (sel0) canvas.fillRoundRect(40, 50, 320, 90, 10, EPD_BLACK);
+  else canvas.drawRoundRect(40, 50, 320, 90, 10, EPD_BLACK);
+  printCentered("CONNECT TO WI-FI", 200, 75, 2, sel0 ? EPD_WHITE : EPD_BLACK, sel0 ? EPD_BLACK : EPD_WHITE);
+  printCentered("auto time, set location after", 200, 108, 1, sel0 ? EPD_WHITE : EPD_BLACK, sel0 ? EPD_BLACK : EPD_WHITE);
 
   bool sel1 = (firstRunCursor == 1);
-  if (sel1) display.fillRoundRect(40, 160, 320, 90, 10, GxEPD_BLACK);
-  else display.drawRoundRect(40, 160, 320, 90, 10, GxEPD_BLACK);
-  printCentered("SET TIME + CITY", 200, 185, 2, sel1 ? GxEPD_WHITE : GxEPD_BLACK, sel1 ? GxEPD_BLACK : GxEPD_WHITE);
-  printCentered("offline, no network needed", 200, 218, 1, sel1 ? GxEPD_WHITE : GxEPD_BLACK, sel1 ? GxEPD_BLACK : GxEPD_WHITE);
+  if (sel1) canvas.fillRoundRect(40, 160, 320, 90, 10, EPD_BLACK);
+  else canvas.drawRoundRect(40, 160, 320, 90, 10, EPD_BLACK);
+  printCentered("SET TIME + CITY", 200, 185, 2, sel1 ? EPD_WHITE : EPD_BLACK, sel1 ? EPD_BLACK : EPD_WHITE);
+  printCentered("offline, no network needed", 200, 218, 1, sel1 ? EPD_WHITE : EPD_BLACK, sel1 ? EPD_BLACK : EPD_WHITE);
 
-  printCentered("UP/DOWN choose   OK select", 200, 286, 1, GxEPD_BLACK, GxEPD_WHITE);
+  printCentered("UP/DOWN choose   OK select", 200, 286, 1, EPD_BLACK, EPD_WHITE);
 }
 
 void drawFirstRunScreen() { fullRefreshGeneric(firstRunContent); }
@@ -1391,7 +1397,7 @@ void setup() {
   // Diagnostic serial output — if the panel ever shows only a blank/stale
   // screen after flashing, open the Serial Monitor at 115200 baud and see
   // exactly which of these lines is the LAST one printed. That pinpoints
-  // whether it's hanging in display.init() versus something later (e.g. it
+  // whether it's hanging in canvas.init() versus something later (e.g. it
   // inits fine but never reaches the first draw). On this board the panel
   // itself is confirmed working (it ran a demo cycling through several
   // screens before this sketch was flashed), so a stuck/unresponsive panel
@@ -1408,34 +1414,26 @@ void setup() {
   pinMode(BTN_OK, INPUT_PULLUP);
 
   pinMode(EPD_PWR, OUTPUT);
-  // UPDATE (resolved): the root cause of "Busy Timeout!" was never the
-  // panel or the board — it was this sketch talking to the controller over
-  // the ESP32's HARDWARE SPI peripheral. Elecrow's own official example for
-  // this exact board (4.2_Example3_PWR) proved the panel works fine; it
-  // just drives SCLK/MOSI with plain digitalWrite() calls ("software"/
-  // bit-banged SPI) instead of the SPI peripheral. GxEPD2 ships an official
-  // variant of its base class that does exactly that when given real
-  // SCLK/MOSI pin numbers, so that variant is vendored into this sketch as
-  // GxEPD2_EPD_SW / GxEPD2_420_GDEY042T81_SW (see those files for the full
-  // story) and used below instead of SPI.begin()/display.init(...) alone.
+  // UPDATE (resolved, take 2): switching to bit-banged SPI alone (keeping
+  // GxEPD2's own register sequence) still timed out. Reading Elecrow's own
+  // working example's driver (EPD.cpp) line by line turned up the REAL
+  // mismatch: this controller needs an older register convention entirely
+  // (init via 0x00/0x01/0x06/.../0xE3, image data to register 0x13, refresh
+  // triggered by 0x17/0xA5) that GxEPD2's generic GDEY042T81 driver never
+  // sends at all (it targets 0x24/0x26/0x20-style commands for a different
+  // controller generation). So this sketch now bypasses GxEPD2 completely
+  // for the e-paper panel: drawing happens on an in-memory Adafruit_GFX
+  // canvas (see `canvas` above), and CrowpanelEPD.cpp — a direct port of
+  // Elecrow's own EPD.cpp/EPD_SPI.cpp — pushes that buffer to the panel
+  // using the exact sequence proven to work on this hardware. See
+  // CrowpanelEPD.h for the full story.
   digitalWrite(EPD_PWR, HIGH);
   delay(50); // let the panel's regulator settle before driving SPI into it
   Serial.println(F("[boot] EPD_PWR set HIGH, regulator should be up"));
 
-  // Software-SPI init: this call configures EPD_SCLK/EPD_MOSI as bit-banged
-  // outputs and MUST come before display.init() below (it sets the pin
-  // numbers that make every subsequent byte write bit-bang instead of going
-  // through the SPI peripheral). reset_duration=50 matches the pulse width
-  // used in the earlier hardware-SPI attempt.
-  display.epd2.init(EPD_SCLK, EPD_MOSI, 115200, true, 50, false);
-  Serial.println(F("[boot] display.epd2.init() (software SPI) done, calling display.init()..."));
-  // Required second call — GxEPD2_BW's own init() does NOT take sck/mosi
-  // args, but it's still needed to finish initializing the upper (buffer/
-  // GFX) layer. It re-applies its own reset but does not touch the sck/mosi
-  // pins already set above, so software SPI stays in effect.
-  display.init(115200, true, 50, false);
-  Serial.println(F("[boot] display.init() returned — if you never saw this line, it hung waiting on the panel (BUSY pin most likely)"));
-  display.setRotation(1); // landscape; try 0/2/3 if the image is sideways/mirrored on your unit
+  crowEpdInit(); // GPIO setup + reset + full register init, ported from Elecrow's own working example
+  Serial.println(F("[boot] crowEpdInit() returned — if you never saw this line, it hung waiting on the panel (BUSY pin most likely)"));
+  canvas.fillScreen(EPD_WHITE); // start the in-memory canvas blank
 
   loadSettings();
   Serial.println(F("[boot] settings loaded, proceeding to first screen"));
