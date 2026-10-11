@@ -83,6 +83,55 @@
       software-side explanation found so far (hardware SPI vs. bit-banged
       SPI, and now the register/command convention itself) has been tried.
 
+  ======================================================================
+  GPS MODE (optional) — GY-GPS6MV2 / GY-NEO6MV2 (u-blox NEO-6M) module
+
+  With a GPS module wired to the board's free GPIO header, the clock sets
+  its own time AND location from satellites — no Wi-Fi, no ZIP/city, no
+  manual clock, and no button presses at all after the one-time choice.
+  Pick "GPS MODULE" on the first-run screen (or Settings > GPS: ON). Wi-Fi
+  and fully-offline modes are unchanged and still work exactly as before.
+
+  Wiring (module pin -> board):
+      VCC -> 3V3          (the GY-GPS6MV2 board has its own 3.3 V regulator
+                           and accepts 3.3-5 V; ~45 mA while searching)
+      GND -> GND
+      TX  -> IO18         (the module TRANSMITS; the ESP32 RECEIVES here)
+      RX  -> IO17         (optional — nothing is ever sent to the module)
+  IO17/IO18 are both on Elecrow's list of free, user-available GPIOs. Check
+  the header's silkscreen on your unit: Elecrow's page doesn't spell out
+  the 2x10 header's pin order, so confirm which pins are IO17, IO18, 3V3
+  and GND before powering anything. To use other pins, change GPS_RX_PIN /
+  GPS_TX_PIN above (avoid IO19/IO20, which are the S3's USB lines).
+
+  What it does:
+    * Time: the first valid fix (NMEA RMC status 'A') sets the system clock
+      to true UTC; it is re-trimmed every ~10 minutes. There is no battery-
+      backed RTC on this board, so every power-up waits for a new fix (the
+      module's own backup battery makes that a few seconds when warm, up
+      to a minute or so cold, outdoors or at a window).
+    * Location: latitude/longitude come straight from the fix and are
+      re-adopted if the device moves more than ~5 km.
+    * Time zone + DST: a GPS fix has no time zone, so the UTC offset and DST
+      rule come from the nearest entry in cities.h's 250-city table, and
+      DST changeovers are followed automatically. Near a zone border far
+      from any listed city this can pick the neighbouring zone; the
+      countdown and the candle-lighting/havdalah INSTANTS stay correct
+      regardless (they're computed in true UTC from lat/lon) — only the
+      wall-clock labels would be an hour or more off.
+    * Some NEO-6M firmware reports dates exactly 1024 weeks (~19.6 years)
+      in the past (the GPS week-number rollover); the sketch detects any
+      date earlier than its own compile date and corrects it.
+    * Setting a ZIP, a city, or the clock by hand switches GPS mode off
+      again (the Settings row shows GPS: ON / OFF).
+    * If nothing shows up: the screen says "NO DATA FROM GPS" (wiring/
+      power), "GPS DATA UNREADABLE" (baud rate), or "ACQUIRING GPS..." with
+      a live satellite count (no sky view). The module's own LED blinks once
+      a second once it has a fix. The Serial Monitor (115200) logs [gps] lines.
+  NOT yet tested against real hardware — written and checked off-device
+  only (the NMEA parser itself was compiled and tested on a PC).
+  ======================================================================
+
   BEFORE YOU FLASH:
   1. No Wi-Fi credentials to set here at all — flash as-is, then from the
      device: MENU > (rotary down to) WI-FI > OK. Connect your phone to the
@@ -206,6 +255,15 @@ const int DEFAULT_HAVDALAH_OFFSET_MIN = 42;  // "3 medium stars" — adjustable 
 #define BTN_DOWN  4
 #define BTN_OK    5
 #define BTN_ACTIVE_LOW 1   // flip to 0 if your unit reads the opposite way
+
+// Optional GPS module (GY-GPS6MV2 / u-blox NEO-6M) on the board's free GPIO
+// header — see "GPS MODE" in the header comment above for wiring. IO17/IO18
+// are both in Elecrow's list of unused, user-available GPIOs and are also the
+// ESP32-S3's default UART1 pins. (IO19/IO20 are deliberately NOT used: on the
+// S3 they double as the native USB D-/D+ lines.)
+#define GPS_RX_PIN 18   // ESP32 receives here   <- GPS module's TX pin
+#define GPS_TX_PIN 17   // ESP32 transmits here  -> GPS module's RX pin (optional; never used to configure the module)
+#define GPS_BAUD   9600 // NEO-6M factory default
 // ------------------------------------------------
 
 // In-memory 1-bit canvas — all drawing happens here (Adafruit_GFX calls),
@@ -231,14 +289,24 @@ String currentPass = "";
 bool hasWifiCreds = false;
 bool usingCity = false;      // true if the location came from the CITY list rather than a ZIP
 String currentCityLabel = ""; // short "City" name shown in the header when usingCity is true
-bool setupDone = false;       // true once first-run setup (Wi-Fi OR offline SET TIME+CITY) has completed once
+bool setupDone = false;       // true once first-run setup (Wi-Fi OR offline SET TIME+CITY OR GPS) has completed once
+
+// GPS mode (persisted). While true, the GPS module is the ONLY source of
+// both the time and the location: no Wi-Fi, no NTP, no ZIP/city, no manual
+// clock — everything below happens automatically, with no user input.
+bool gpsMode = false;
+// True when the current latitude/longitude came from a GPS fix (persisted),
+// so the header keeps showing "GPS 36.17N 115.14W" instead of a stale ZIP
+// even if GPS mode is later switched off. Cleared by saveZip()/selectCity().
+bool locFromGps = false;
 
 // ---------------- First-run setup state (not persisted) ----------------
 // Set true only while the SCR_FIRST_RUN sequence is in progress, so the
 // SET TIME and Wi-Fi-portal flows know to route back into first-run (CITY
 // list / SCR_CLOCK) instead of to Settings once they finish.
 bool firstRunActive = false;
-int firstRunCursor = 0; // 0 = CONNECT TO WI-FI, 1 = SET TIME + CITY (OFFLINE)
+int firstRunCursor = 0; // 0 = CONNECT TO WI-FI, 1 = SET TIME + CITY (OFFLINE), 2 = GPS MODULE
+const int FIRST_RUN_OPTIONS = 3;
 
 // ---------------- Runtime state ----------------
 time_t candleLightingEpoch = 0;
@@ -274,7 +342,9 @@ const unsigned long FULL_REFRESH_INTERVAL_MS = 30UL * 60UL * 1000UL; // ghost-cl
 
 AppScreen screen = SCR_CLOCK;
 int settingsCursor = 0;
-const char* SETTINGS_LABELS[7] = { "ZIP CODE", "CITY", "WI-FI", "SET TIME", "HAVDALAH OFFSET", "SYSTEM RESET", "BACK" };
+// Index 4 ("GPS") is a placeholder: settingsContent() draws "GPS: ON"/"GPS: OFF" instead.
+#define SETTINGS_COUNT 8
+const char* SETTINGS_LABELS[SETTINGS_COUNT] = { "ZIP CODE", "CITY", "WI-FI", "SET TIME", "GPS", "HAVDALAH OFFSET", "SYSTEM RESET", "BACK" };
 int confirmResetCursor = 1; // 0 = YES, 1 = CANCEL (default); confirm screen for Settings > SYSTEM RESET
 
 int cityListTop = 0;    // index of the first visible row in the CITY list screen
@@ -711,6 +781,8 @@ void loadSettings() {
   cityUtcOffsetHours = prefs.getFloat("cityUtcOff", 0.0f);
   cityDstRule = (uint8_t)prefs.getUInt("cityDst", 255);
   setupDone = prefs.getBool("setupDone", false);
+  gpsMode = prefs.getBool("gpsMode", false);
+  locFromGps = prefs.getBool("locGps", false);
   prefs.end();
 }
 
@@ -751,9 +823,11 @@ void saveZip(const String &zip) {
   // would keep using a stale, unrelated city's offset/DST rule.
   prefs.putFloat("cityUtcOff", 0.0f);
   prefs.putUInt("cityDst", 255);
+  prefs.putBool("locGps", false); // the location is about to come from a ZIP, not GPS
   prefs.end();
   currentZip = zip;
   usingCity = false;
+  locFromGps = false;
   cityUtcOffsetHours = 0.0f;
   cityDstRule = 255;
 }
@@ -764,6 +838,7 @@ void saveZip(const String &zip) {
 // needed at all, since the list already carries lat/lon.
 void selectCity(int idx) {
   if (idx < 0 || idx >= CITY_COUNT) return;
+  if (gpsMode) setGpsMode(false); // picking a city by hand means leaving GPS mode
   latitude = CITY_LIST[idx].lat;
   longitude = CITY_LIST[idx].lon;
 
@@ -772,6 +847,7 @@ void selectCity(int idx) {
   currentCityLabel = (comma >= 0) ? full.substring(0, comma) : full;
   currentCityLabel.toUpperCase();
   usingCity = true;
+  locFromGps = false;
   cityUtcOffsetHours = CITY_LIST[idx].utcOffsetHours;
   cityDstRule = CITY_LIST[idx].dstRule;
 
@@ -780,6 +856,7 @@ void selectCity(int idx) {
   prefs.putDouble("lon", longitude);
   prefs.putBool("hasCoords", true);
   prefs.putBool("usingCity", true);
+  prefs.putBool("locGps", false);
   prefs.putString("cityLbl", currentCityLabel);
   prefs.putFloat("cityUtcOff", cityUtcOffsetHours);
   prefs.putUInt("cityDst", (uint32_t)cityDstRule);
@@ -804,6 +881,12 @@ void selectCity(int idx) {
         localUtcOffsetSeconds = (long)lround(longitude / 15.0) * 3600; // rough fallback if the lookup fails
         saveUtcOffset();
       }
+    } else if (!clockIsLocalLabeled) {
+      // A genuinely-UTC clock but no network to ask — this is what a clock
+      // that was last set by GPS looks like once the user hand-picks a
+      // different city. Take the offset (and DST) from the city table so
+      // the displayed times follow the NEW city, not the old location.
+      applyCityTableOffset();
     }
     computeShabbatTimes();
   }
@@ -845,6 +928,14 @@ void saveWifiCreds(const String &ssid, const String &pass) {
   currentSsid = ssid;
   currentPass = pass;
   hasWifiCreds = currentSsid.length() > 0;
+  if (gpsMode) {
+    // GPS owns the clock and location while it's on. Just remember the
+    // credentials for later (they're used again if GPS mode is turned off);
+    // don't touch the clock — hasWallClock = attemptNtpSync() below would
+    // clobber a good GPS-set clock if the network happened to be down.
+    screenNeedsFullRedraw = true;
+    return;
+  }
   hasWallClock = attemptNtpSync(15000, 8000);
   clockIsLocalLabeled = false; // NTP-synced clock is true UTC
   lastNtpAttemptMs = millis();
@@ -860,10 +951,319 @@ void saveWifiCreds(const String &ssid, const String &pass) {
 }
 
 void saveZipAndTriggerGeocode(const String &zip) {
+  if (gpsMode) setGpsMode(false); // entering a ZIP by hand means leaving GPS mode
   saveZip(zip);
   needsGeocode = true;
   candleLightingEpoch = 0;
   havdalahEpoch = 0;
+}
+
+// =========================================================================
+// GPS MODE — GY-GPS6MV2 (u-blox NEO-6M) on UART1 as the time + location source
+//
+// While gpsMode is on, the GPS module is the ONLY source of the clock and the
+// location. The first valid fix sets the system clock to true UTC (the same
+// kind of clock NTP gives, so clockIsLocalLabeled stays false and the existing
+// solar math is used unchanged), adopts the fix's latitude/longitude, and
+// picks a UTC offset + DST rule from the nearest entry in CITY_LIST. After
+// that it keeps the clock trimmed every ~10 minutes and follows the device if
+// it moves more than ~5 km. Nothing needs a button press, a Wi-Fi network or
+// a ZIP/city. Time zone note: the GPS fix gives an exact LOCATION but no time
+// zone, so the zone comes from the nearest listed city — that can be wrong
+// near a time-zone border far from any listed city. (The candle-lighting and
+// havdalah INSTANTS and the countdown are computed from lat/lon in true UTC,
+// so they stay correct either way; only the wall-clock labels would be off.)
+// =========================================================================
+
+// ---- GPS PARSER BEGIN (plain C++ — this section is also compiled and unit-tested on a PC) ----
+static char gpsLine[100];
+static uint8_t gpsLineLen = 0;
+static bool gpsInSentence = false;
+unsigned long gpsCharsSeen = 0;    // every byte received from the module
+unsigned long gpsSentencesOk = 0;  // sentences that passed their NMEA checksum
+int gpsSatsTracked = 0;            // satellites with a real signal (SNR > 0), from the latest complete GSV cycle
+static int gpsGsvRunning = 0;
+
+void gpsOnFix(double lat, double lon, int y, int mo, int d, int h, int mi, int s); // defined below the parser
+
+static bool gpsTwoDigits(const char* p, int &out) {
+  if (p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9') return false;
+  out = (p[0] - '0') * 10 + (p[1] - '0');
+  return true;
+}
+
+// NMEA coordinates are ddmm.mmmm (latitude) or dddmm.mmmm (longitude);
+// dividing by 100 and splitting off the whole part handles both.
+static double gpsNmeaToDegrees(const char* s) {
+  double v = atof(s);
+  double deg = floor(v / 100.0);
+  return deg + (v - deg * 100.0) / 60.0;
+}
+
+// s points just after the '$'. Verifies the "*HH" checksum (XOR of every
+// character between '$' and '*') and, if good, cuts the string at the '*'.
+static bool gpsChecksumOk(char* s) {
+  char* star = strchr(s, '*');
+  if (!star || !isxdigit((unsigned char)star[1]) || !isxdigit((unsigned char)star[2])) return false;
+  uint8_t cs = 0;
+  for (char* p = s; p < star; p++) cs ^= (uint8_t)*p;
+  char hex[3] = { star[1], star[2], 0 };
+  uint8_t want = (uint8_t)strtoul(hex, nullptr, 16);
+  *star = 0;
+  return cs == want;
+}
+
+// Splits s in place on commas; f[] receives pointers to each field (empty
+// fields come back as ""). Returns the field count.
+static int gpsSplit(char* s, char** f, int maxf) {
+  int n = 0;
+  f[n++] = s;
+  for (char* p = s; *p && n < maxf; p++) {
+    if (*p == ',') { *p = 0; f[n++] = p + 1; }
+  }
+  return n;
+}
+
+// $--RMC,hhmmss.ss,A,ddmm.mmmm,N,dddmm.mmmm,E,speed,course,ddmmyy,...
+// Status 'A' = valid fix, 'V' = warning (no fix) — 'V' sentences are ignored
+// entirely, including their time/date, since an unlocked receiver can emit a
+// default/guessed date.
+static void gpsHandleRMC(char** f, int nf) {
+  if (nf < 10 || f[2][0] != 'A') return;
+  int hh, mi, ss, dd, mo, yy;
+  if (strlen(f[1]) < 6 || !gpsTwoDigits(f[1], hh) || !gpsTwoDigits(f[1] + 2, mi) || !gpsTwoDigits(f[1] + 4, ss)) return;
+  if (strlen(f[9]) < 6 || !gpsTwoDigits(f[9], dd) || !gpsTwoDigits(f[9] + 2, mo) || !gpsTwoDigits(f[9] + 4, yy)) return;
+  if (hh > 23 || mi > 59 || ss > 60 || dd < 1 || dd > 31 || mo < 1 || mo > 12) return;
+  if (ss == 60) ss = 59; // leap second
+  if (f[3][0] == 0 || f[5][0] == 0) return;
+  if ((f[4][0] != 'N' && f[4][0] != 'S') || (f[6][0] != 'E' && f[6][0] != 'W')) return;
+  double lat = gpsNmeaToDegrees(f[3]); if (f[4][0] == 'S') lat = -lat;
+  double lon = gpsNmeaToDegrees(f[5]); if (f[6][0] == 'W') lon = -lon;
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return;
+  if (lat == 0.0 && lon == 0.0) return; // "null island" is what an unparsed/empty fix looks like
+  gpsOnFix(lat, lon, 2000 + yy, mo, dd, hh, mi, ss);
+}
+
+// $--GSV,totalMsgs,msgNum,satsInView,{PRN,elev,azimuth,SNR} x up to 4
+// An empty/zero SNR means the satellite is known (from the almanac) but not
+// actually being received — so counting SNR > 0 is a real "is the antenna
+// hearing anything" signal, unlike the in-view count.
+static void gpsHandleGSV(char** f, int nf) {
+  if (nf < 4) return;
+  int total = atoi(f[1]), num = atoi(f[2]);
+  if (num == 1) gpsGsvRunning = 0;
+  for (int i = 4; i + 3 < nf; i += 4) {
+    if (f[i + 3][0] != 0 && atoi(f[i + 3]) > 0) gpsGsvRunning++;
+  }
+  if (num == total) gpsSatsTracked = gpsGsvRunning;
+}
+
+static void gpsHandleSentence(char* s) {
+  if (!gpsChecksumOk(s)) return;
+  gpsSentencesOk++;
+  char* f[24];
+  int nf = gpsSplit(s, f, 24);
+  if (strlen(f[0]) != 5) return; // "GPRMC", "GNGSV", ... — 2-letter talker + 3-letter type
+  const char* type = f[0] + 2;
+  if (strcmp(type, "RMC") == 0) gpsHandleRMC(f, nf);
+  else if (strcmp(type, "GSV") == 0) gpsHandleGSV(f, nf);
+}
+
+void gpsFeedByte(char c) {
+  gpsCharsSeen++;
+  if (c == '$') { gpsLineLen = 0; gpsInSentence = true; return; }
+  if (!gpsInSentence) return;
+  if (c == '\r' || c == '\n') {
+    if (gpsLineLen > 0) { gpsLine[gpsLineLen] = 0; gpsHandleSentence(gpsLine); }
+    gpsInSentence = false;
+    gpsLineLen = 0;
+    return;
+  }
+  if (gpsLineLen < sizeof(gpsLine) - 1) gpsLine[gpsLineLen++] = c;
+  else { gpsInSentence = false; gpsLineLen = 0; } // overlong line = garbage; drop it
+}
+// ---- GPS PARSER END ----
+
+// ---- GPS session state ----
+unsigned long gpsStartMs = 0;
+bool gpsSerialStarted = false;
+bool gpsClockSetOnce = false;      // has this GPS session set the system clock yet?
+unsigned long gpsLastClockSetMs = 0;
+bool gpsPosApplied = false;        // has this GPS session adopted a position yet?
+double gpsAppliedLat = 0.0, gpsAppliedLon = 0.0;
+unsigned long gpsLastPersistMs = 0; // 0 = not persisted yet this session
+unsigned long gpsLastLogMs = 0;
+const unsigned long GPS_CLOCK_RESYNC_MS = 10UL * 60UL * 1000UL;     // re-trim the clock this often
+const unsigned long GPS_PERSIST_MIN_INTERVAL_MS = 10UL * 60UL * 1000UL; // flash-wear limit on saving the position
+const unsigned long GPS_ACQUIRE_REFRESH_MS = 30UL * 1000UL;         // screen refresh rate while waiting for the first fix
+const double GPS_MOVE_THRESHOLD_DEG = 0.05;                         // ~5.5 km — re-adopt the position past this
+
+void gpsResetSession() {
+  gpsClockSetOnce = false;
+  gpsLastClockSetMs = 0;
+  gpsPosApplied = false;
+  gpsLastPersistMs = 0;
+}
+
+void gpsBegin() {
+  if (gpsSerialStarted) return;
+  Serial1.setRxBufferSize(1024); // must precede begin(); holds ~1 s of NMEA through a slow e-paper refresh
+  Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  gpsSerialStarted = true;
+  gpsStartMs = millis();
+  gpsCharsSeen = 0;
+  gpsSentencesOk = 0;
+  gpsSatsTracked = 0;
+  Serial.printf("[gps] UART1 started: ESP RX=IO%d (GPS TX), ESP TX=IO%d (GPS RX), %d baud\n", GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
+}
+
+void gpsEnd() {
+  if (!gpsSerialStarted) return;
+  Serial1.end();
+  gpsSerialStarted = false;
+}
+
+// Called every loop() iteration (any screen). Non-blocking; capped so a
+// flood of bytes can never starve the button/UI handling.
+void gpsPoll() {
+  if (!gpsMode || !gpsSerialStarted) return;
+  int budget = 512;
+  while (budget-- > 0 && Serial1.available() > 0) gpsFeedByte((char)Serial1.read());
+  if (millis() - gpsLastLogMs > 15000) {
+    gpsLastLogMs = millis();
+    Serial.printf("[gps] bytes=%lu sentences=%lu tracking=%d clockSet=%d\n",
+                  gpsCharsSeen, gpsSentencesOk, gpsSatsTracked, (int)gpsClockSetOnce);
+  }
+}
+
+// Index of the CITY_LIST entry closest to (lat, lon). Squared planar
+// distance with longitude scaled by cos(lat) — plenty accurate for "which
+// listed city is nearest"; no trig-heavy great-circle math needed.
+static int gpsNearestCityIndex(double lat, double lon) {
+  int best = 0;
+  double bestD = 1e18;
+  double cl = cos(lat * DEG_TO_RAD);
+  for (int i = 0; i < CITY_COUNT; i++) {
+    double dy = (double)CITY_LIST[i].lat - lat;
+    double dx = (double)CITY_LIST[i].lon - lon;
+    if (dx > 180.0) dx -= 360.0;
+    if (dx < -180.0) dx += 360.0;
+    dx *= cl;
+    double d2 = dx * dx + dy * dy;
+    if (d2 < bestD) { bestD = d2; best = i; }
+  }
+  return best;
+}
+
+// Recomputes localUtcOffsetSeconds (standard offset + DST if the city's rule
+// says it's active today) from cityUtcOffsetHours/cityDstRule. Only valid
+// with a true-UTC clock. Cheap, so it's also called once a minute in GPS
+// mode — that's what carries the display across a DST changeover.
+void applyCityTableOffset() {
+  if (cityDstRule == 255) return;
+  long stdOff = (long)lround(cityUtcOffsetHours * 3600.0);
+  long localDays = (long)((time(nullptr) + stdOff) / 86400);
+  int y, m, d;
+  civilFromDays(localDays, y, m, d);
+  long off = stdOff + (dstRuleActive(cityDstRule, y, m, d) ? 3600 : 0);
+  if (!hasUtcOffset || off != localUtcOffsetSeconds) {
+    localUtcOffsetSeconds = off;
+    saveUtcOffset();
+  }
+}
+
+// A valid (status 'A') RMC fix arrived — called by the parser, about once a
+// second. Most calls return immediately; real work happens on the first fix,
+// every GPS_CLOCK_RESYNC_MS, and when the position has moved noticeably.
+void gpsOnFix(double lat, double lon, int y, int mo, int d, int h, int mi, int s) {
+  if (!gpsMode) return;
+  // After a slow screen refresh the UART buffer holds a backlog of OLD
+  // sentences; their timestamps are seconds stale. Only act on a sentence
+  // that was processed (nearly) live, i.e. with little left queued behind it.
+  if (Serial1.available() > 120) return;
+
+  unsigned long nowMs = millis();
+  bool wasMissingClock = !hasWallClock;
+  bool clockDue = !gpsClockSetOnce || !hasWallClock || clockIsLocalLabeled
+                  || (nowMs - gpsLastClockSetMs > GPS_CLOCK_RESYNC_MS);
+  bool posDue = !gpsPosApplied
+                || fabs(lat - gpsAppliedLat) > GPS_MOVE_THRESHOLD_DEG
+                || fabs(lon - gpsAppliedLon) > GPS_MOVE_THRESHOLD_DEG;
+  if (!clockDue && !posDue) return;
+
+  if (clockDue) {
+    time_t t = utcToEpoch(y, mo, d, h, mi, s);
+    // GPS week-number rollover guard: some u-blox 6 firmware reports dates
+    // exactly 1024 weeks (7168 days) in the past, i.e. ~20 years early. The
+    // sketch can't have been built before its own compile date, so any GPS
+    // date earlier than that is wrong by whole rollovers; add them back
+    // (time-of-day and weekday are unaffected by a rollover).
+    int by, bm, bd;
+    compileBuildDate(by, bm, bd);
+    time_t floorT = utcToEpoch(by, bm, bd, 0, 0, 0) - 86400;
+    for (int i = 0; i < 3 && t < floorT; i++) t += (time_t)7168 * 86400;
+    struct timeval tv = { t, 0 };
+    settimeofday(&tv, nullptr);
+    gpsLastClockSetMs = nowMs;
+    gpsClockSetOnce = true;
+    hasWallClock = true;
+    clockIsLocalLabeled = false; // GPS time is true UTC, same as NTP
+    Serial.printf("[gps] clock set from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC\n", y, mo, d, h, mi, s);
+  }
+
+  if (posDue) {
+    latitude = lat;
+    longitude = lon;
+    hasCoords = true;
+    gpsAppliedLat = lat;
+    gpsAppliedLon = lon;
+    gpsPosApplied = true;
+    locFromGps = true;
+    usingCity = false;
+    needsGeocode = false;
+    int ci = gpsNearestCityIndex(lat, lon);
+    cityUtcOffsetHours = CITY_LIST[ci].utcOffsetHours;
+    cityDstRule = CITY_LIST[ci].dstRule;
+    Serial.printf("[gps] position %.4f, %.4f -> time zone from nearest listed city: %s\n", lat, lon, CITY_LIST[ci].name);
+    // Persist (rate-limited — a moving device would otherwise rewrite flash
+    // every few seconds). Only a "last known location" for the header; the
+    // clock itself can't survive a reboot without a new fix anyway.
+    if (gpsLastPersistMs == 0 || nowMs - gpsLastPersistMs > GPS_PERSIST_MIN_INTERVAL_MS) {
+      prefs.begin("shabbat", false);
+      prefs.putDouble("lat", lat);
+      prefs.putDouble("lon", lon);
+      prefs.putBool("hasCoords", true);
+      prefs.putBool("usingCity", false);
+      prefs.putBool("locGps", true);
+      prefs.putFloat("cityUtcOff", cityUtcOffsetHours);
+      prefs.putUInt("cityDst", (uint32_t)cityDstRule);
+      prefs.end();
+      gpsLastPersistMs = nowMs;
+    }
+  }
+
+  applyCityTableOffset();
+  // computeShabbatTimes() flags a full screen refresh, so only call it when
+  // something it depends on really changed — not on every routine clock trim.
+  if (posDue || wasMissingClock) computeShabbatTimes();
+}
+
+// Turns GPS mode on/off and persists the choice. Turning it OFF leaves the
+// current clock and location in place and (if Wi-Fi credentials exist) lets
+// the normal background NTP sync take over again right away.
+void setGpsMode(bool on) {
+  gpsMode = on;
+  prefs.begin("shabbat", false);
+  prefs.putBool("gpsMode", on);
+  prefs.end();
+  if (on) {
+    gpsResetSession();
+    gpsBegin();
+  } else {
+    gpsEnd();
+    lastNtpAttemptMs = millis() - NTP_RESYNC_INTERVAL_MS - 1UL; // "NTP is due now"
+  }
+  screenNeedsFullRedraw = true;
 }
 
 // =========================================================================
@@ -917,7 +1317,18 @@ void drawHeader() {
   drawCandleIcon(10, 16, EPD_WHITE);
   drawCandleIcon(22, 16, EPD_WHITE);
 
-  String zipText = usingCity ? currentCityLabel : ("ZIP " + currentZip);
+  String zipText;
+  if (locFromGps && hasCoords) {
+    char gb[32];
+    snprintf(gb, sizeof(gb), "GPS %.2f%c %.2f%c",
+             fabs(latitude), latitude >= 0 ? 'N' : 'S',
+             fabs(longitude), longitude >= 0 ? 'E' : 'W');
+    zipText = gb;
+  } else if (gpsMode && !hasCoords) {
+    zipText = "GPS SEARCHING";
+  } else {
+    zipText = usingCity ? currentCityLabel : ("ZIP " + currentZip);
+  }
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setTextSize(1);
   canvas.setTextColor(EPD_WHITE, EPD_BLACK);
@@ -956,6 +1367,29 @@ void countdownStrings(String &lineTop, String &lineBottom) {
   lineBottom = buf2;
 }
 
+// Shown in the countdown frame while GPS mode is waiting for its first fix.
+// The wording doubles as a bring-up diagnostic, since "no wire", "wrong baud"
+// and "no sky view" are the three ways a GPS module typically fails to work.
+void drawGpsAcquiring() {
+  unsigned long up = millis() - gpsStartMs;
+  char buf[48];
+  if (gpsCharsSeen == 0 && up > 8000) {
+    printCentered("NO DATA FROM GPS", 200, 100, 2, EPD_BLACK, EPD_WHITE);
+    snprintf(buf, sizeof(buf), "check wiring: GPS TX -> IO%d", GPS_RX_PIN);
+    printCentered(buf, 200, 128, 1, EPD_BLACK, EPD_WHITE);
+    printCentered("and GPS VCC -> 3V3, GND -> GND", 200, 146, 1, EPD_BLACK, EPD_WHITE);
+  } else if (gpsCharsSeen > 0 && gpsSentencesOk == 0 && up > 10000) {
+    printCentered("GPS DATA UNREADABLE", 200, 100, 2, EPD_BLACK, EPD_WHITE);
+    snprintf(buf, sizeof(buf), "expected %d baud - check module", GPS_BAUD);
+    printCentered(buf, 200, 128, 1, EPD_BLACK, EPD_WHITE);
+  } else {
+    printCentered("ACQUIRING GPS...", 200, 100, 2, EPD_BLACK, EPD_WHITE);
+    snprintf(buf, sizeof(buf), "tracking %d satellite%s", gpsSatsTracked, gpsSatsTracked == 1 ? "" : "s");
+    printCentered(buf, 200, 128, 1, EPD_BLACK, EPD_WHITE);
+    printCentered("needs open sky - try a window", 200, 146, 1, EPD_BLACK, EPD_WHITE);
+  }
+}
+
 void drawCountdownArea() {
   printCentered("TIME REMAINING", 200, 42, 3, EPD_BLACK, EPD_WHITE);
 
@@ -968,7 +1402,9 @@ void drawCountdownArea() {
   // offline (manually-set clock, no Wi-Fi) device doesn't wrongly show a
   // Wi-Fi nag once its clock has been set.
   if (!hasWallClock) {
-    if (hasWifiCreds) {
+    if (gpsMode) {
+      drawGpsAcquiring();
+    } else if (hasWifiCreds) {
       printCentered("SYNCING TIME...", 200, 105, 2, EPD_BLACK, EPD_WHITE);
       printCentered("(waiting on Wi-Fi/NTP)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
     } else {
@@ -976,8 +1412,13 @@ void drawCountdownArea() {
       printCentered("(MENU > Settings)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
     }
   } else if (!hasCoords) {
-    printCentered("NO LOCATION SET", 200, 105, 2, EPD_BLACK, EPD_WHITE);
-    printCentered("(MENU > Settings)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
+    if (gpsMode) {
+      printCentered("WAITING FOR GPS FIX", 200, 105, 2, EPD_BLACK, EPD_WHITE);
+      printCentered("(needs open sky)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
+    } else {
+      printCentered("NO LOCATION SET", 200, 105, 2, EPD_BLACK, EPD_WHITE);
+      printCentered("(MENU > Settings)", 200, 132, 1, EPD_BLACK, EPD_WHITE);
+    }
   } else if (needsGeocode) {
     printCentered("LOCATING...", 200, 112, 2, EPD_BLACK, EPD_WHITE);
   } else if (candleLightingEpoch == 0 || havdalahEpoch == 0) {
@@ -1094,11 +1535,11 @@ void settingsContent() {
   // ZIP CODE and CITY render as two side-by-side half-width boxes in one
   // row — a visual cue that they're alternatives, not two separate
   // settings — which frees up more spacing for the rows below. UP/DOWN
-  // still cycles through all 7 options in order (settingsCursor 0-6); ZIP
+  // still cycles through all 8 options in order (settingsCursor 0-7); ZIP
   // and CITY just share a row, with whichever one is current highlighted.
-  // rowH/rowStep are trimmed slightly from their original 32/44 so the new
-  // SYSTEM RESET row still fits above the footer hint at y=286.
-  const int top = 30, rowH = 30, rowStep = 40;
+  // rowH/rowStep are trimmed (originally 32/44, then 30/40) so the GPS row
+  // fits too: the last row ends at y=262, above the footer hint at y=286.
+  const int top = 30, rowH = 28, rowStep = 34;
 
   bool selZip = (settingsCursor == 0);
   if (selZip) canvas.fillRoundRect(20, top, 175, rowH, 6, EPD_BLACK);
@@ -1110,14 +1551,20 @@ void settingsContent() {
   else canvas.drawRoundRect(205, top, 175, rowH, 6, EPD_BLACK);
   printCentered("CITY", 292, top + 6, 2, selCity ? EPD_WHITE : EPD_BLACK, selCity ? EPD_BLACK : EPD_WHITE);
 
-  for (int i = 2; i < 7; i++) {
+  for (int i = 2; i < SETTINGS_COUNT; i++) {
     int y = top + (i - 1) * rowStep;
     bool selected = (i == settingsCursor);
     uint16_t fg = selected ? EPD_WHITE : EPD_BLACK;
     uint16_t bg = selected ? EPD_BLACK : EPD_WHITE;
     if (selected) canvas.fillRoundRect(30, y, 340, rowH, 6, EPD_BLACK);
     else canvas.drawRoundRect(30, y, 340, rowH, 6, EPD_BLACK);
-    printCentered(SETTINGS_LABELS[i], 200, y + 6, 2, fg, bg);
+    const char* label = SETTINGS_LABELS[i];
+    char gpsLabel[12];
+    if (i == 4) { // the GPS row shows its current state
+      snprintf(gpsLabel, sizeof(gpsLabel), "GPS: %s", gpsMode ? "ON" : "OFF");
+      label = gpsLabel;
+    }
+    printCentered(label, 200, y + 5, 2, fg, bg);
   }
   printCentered("UP/DOWN move   OK select   EXIT back", 200, 286, 1, EPD_BLACK, EPD_WHITE);
 }
@@ -1265,6 +1712,7 @@ void handleNumEntryButtons() {
         break;
       case NUM_MINUTE: {
         tmpMinute = numValue;
+        if (gpsMode) setGpsMode(false); // setting the clock by hand means leaving GPS mode
         if (hasWifiCreds) {
           // Online path: derive the local UTC offset by comparing the
           // entered local time against the NTP-verified (true UTC) system clock.
@@ -1302,8 +1750,8 @@ void handleNumEntryButtons() {
 }
 
 void handleSettingsButtons() {
-  if (upPressed())   { settingsCursor = (settingsCursor + 6) % 7; drawSettingsScreen(); }
-  if (downPressed()) { settingsCursor = (settingsCursor + 1) % 7; drawSettingsScreen(); }
+  if (upPressed())   { settingsCursor = (settingsCursor + SETTINGS_COUNT - 1) % SETTINGS_COUNT; drawSettingsScreen(); }
+  if (downPressed()) { settingsCursor = (settingsCursor + 1) % SETTINGS_COUNT; drawSettingsScreen(); }
   if (exitPressed()) { screen = SCR_CLOCK; screenNeedsFullRedraw = true; }
   if (okPressed()) {
     switch (settingsCursor) {
@@ -1311,9 +1759,16 @@ void handleSettingsButtons() {
       case 1: cityListTop = 0; cityListCursor = 0; screen = SCR_CITY_LIST; drawCityListScreen(); break;
       case 2: screen = SCR_WIFI_SETUP; startWifiSetupPortal(); break;
       case 3: startSetTimeEntry(); break;
-      case 4: startHavdalahEntry(); break;
-      case 5: confirmResetCursor = 1; screen = SCR_CONFIRM_RESET; drawConfirmResetScreen(); break;
-      case 6: screen = SCR_CLOCK; screenNeedsFullRedraw = true; break;
+      case 4:
+        // Toggle GPS mode. Turning it ON jumps to the clock screen so the
+        // "ACQUIRING GPS..." status is visible; turning it OFF stays here.
+        setGpsMode(!gpsMode);
+        if (gpsMode) { screen = SCR_CLOCK; screenNeedsFullRedraw = true; }
+        else drawSettingsScreen();
+        break;
+      case 5: startHavdalahEntry(); break;
+      case 6: confirmResetCursor = 1; screen = SCR_CONFIRM_RESET; drawConfirmResetScreen(); break;
+      case 7: screen = SCR_CLOCK; screenNeedsFullRedraw = true; break;
     }
   }
 }
@@ -1378,6 +1833,11 @@ void performSystemReset() {
   clockIsLocalLabeled = false;
   needsGeocode = false;
   screenNeedsFullRedraw = true;
+
+  gpsMode = false;
+  locFromGps = false;
+  gpsEnd();
+  gpsResetSession();
 
   firstRunActive = true;
   screen = SCR_FIRST_RUN;
@@ -1545,17 +2005,24 @@ void firstRunContent() {
   canvas.fillRect(0, 0, SCREEN_W, 26, EPD_BLACK);
   printCentered("WELCOME - SET UP CLOCK", 200, 4, 1, EPD_WHITE, EPD_BLACK);
 
-  bool sel0 = (firstRunCursor == 0);
-  if (sel0) canvas.fillRoundRect(40, 50, 320, 90, 10, EPD_BLACK);
-  else canvas.drawRoundRect(40, 50, 320, 90, 10, EPD_BLACK);
-  printCentered("CONNECT TO WI-FI", 200, 75, 2, sel0 ? EPD_WHITE : EPD_BLACK, sel0 ? EPD_BLACK : EPD_WHITE);
-  printCentered("auto time, set location after", 200, 108, 1, sel0 ? EPD_WHITE : EPD_BLACK, sel0 ? EPD_BLACK : EPD_WHITE);
-
-  bool sel1 = (firstRunCursor == 1);
-  if (sel1) canvas.fillRoundRect(40, 160, 320, 90, 10, EPD_BLACK);
-  else canvas.drawRoundRect(40, 160, 320, 90, 10, EPD_BLACK);
-  printCentered("SET TIME + CITY", 200, 185, 2, sel1 ? EPD_WHITE : EPD_BLACK, sel1 ? EPD_BLACK : EPD_WHITE);
-  printCentered("offline, no network needed", 200, 218, 1, sel1 ? EPD_WHITE : EPD_BLACK, sel1 ? EPD_BLACK : EPD_WHITE);
+  // Three stacked option boxes, 70px tall with an 82px pitch (y = 34/116/198,
+  // the last ends at y=268, above the footer hint at y=286).
+  struct FirstRunOption { const char* title; const char* sub; };
+  static const FirstRunOption OPTS[FIRST_RUN_OPTIONS] = {
+    { "CONNECT TO WI-FI",  "auto time, set location after" },
+    { "SET TIME + CITY",   "offline, no network needed" },
+    { "GPS MODULE",        "automatic time + location" },
+  };
+  for (int i = 0; i < FIRST_RUN_OPTIONS; i++) {
+    int y = 34 + i * 82;
+    bool sel = (firstRunCursor == i);
+    uint16_t fg = sel ? EPD_WHITE : EPD_BLACK;
+    uint16_t bg = sel ? EPD_BLACK : EPD_WHITE;
+    if (sel) canvas.fillRoundRect(40, y, 320, 70, 10, EPD_BLACK);
+    else canvas.drawRoundRect(40, y, 320, 70, 10, EPD_BLACK);
+    printCentered(OPTS[i].title, 200, y + 14, 2, fg, bg);
+    printCentered(OPTS[i].sub, 200, y + 44, 1, fg, bg);
+  }
 
   printCentered("UP/DOWN choose   OK select", 200, 286, 1, EPD_BLACK, EPD_WHITE);
 }
@@ -1563,11 +2030,19 @@ void firstRunContent() {
 void drawFirstRunScreen() { fullRefreshGeneric(firstRunContent); }
 
 void handleFirstRunButtons() {
-  if (upPressed() || downPressed()) {
-    firstRunCursor = 1 - firstRunCursor;
-    drawFirstRunScreen();
-  }
+  if (upPressed())   { firstRunCursor = (firstRunCursor + FIRST_RUN_OPTIONS - 1) % FIRST_RUN_OPTIONS; drawFirstRunScreen(); }
+  if (downPressed()) { firstRunCursor = (firstRunCursor + 1) % FIRST_RUN_OPTIONS; drawFirstRunScreen(); }
   if (okPressed()) {
+    if (firstRunCursor == 2) {
+      // GPS: nothing else to ask. The clock and location arrive by themselves
+      // once the module gets a fix, so setup is complete right now.
+      setGpsMode(true);
+      markSetupDone();
+      firstRunActive = false;
+      screen = SCR_CLOCK;
+      screenNeedsFullRedraw = true;
+      return;
+    }
     firstRunActive = true;
     if (firstRunCursor == 0) {
       screen = SCR_WIFI_SETUP;
@@ -1638,6 +2113,20 @@ void setup() {
     return;
   }
 
+  if (gpsMode) {
+    // GPS mode: no Wi-Fi, no NTP. The clock stays unset (there's no battery-
+    // backed RTC) until the module delivers its first valid fix — loop()
+    // feeds the parser and shows "ACQUIRING GPS..." until then. A GPS
+    // module with its backup battery warm-starts in a few seconds; a cold
+    // start outdoors is typically well under a minute.
+    gpsBegin();
+    hasWallClock = false;
+    clockIsLocalLabeled = false;
+    screen = SCR_CLOCK;
+    screenNeedsFullRedraw = true;
+    return;
+  }
+
   if (hasWifiCreds) {
     fullRefreshGeneric(connectingContent);
     hasWallClock = attemptNtpSync(15000, 8000);
@@ -1666,6 +2155,8 @@ void setup() {
 }
 
 void loop() {
+  gpsPoll(); // no-op unless GPS mode is on; runs on every screen so no NMEA is missed
+
   switch (screen) {
     case SCR_CLOCK: {
       if (menuPressed()) {
@@ -1678,8 +2169,9 @@ void loop() {
       // Background NTP: bounded, retried on an interval, no UI while
       // waiting — same shape as the touchscreen sketches' loop(), just
       // without a "CONNECTING..." screen (see attemptNtpSync's note).
+      // Skipped entirely in GPS mode, which supplies the clock itself.
       unsigned long retryInterval = hasWallClock ? NTP_RESYNC_INTERVAL_MS : NTP_RETRY_INTERVAL_MS;
-      if (hasWifiCreds && millis() - lastNtpAttemptMs > retryInterval) {
+      if (hasWifiCreds && !gpsMode && millis() - lastNtpAttemptMs > retryInterval) {
         lastNtpAttemptMs = millis();
         bool hadWallClock = hasWallClock;
         if (attemptNtpSync(6000, 5000)) {
@@ -1708,8 +2200,13 @@ void loop() {
         fullRefreshClock();
         screenNeedsFullRedraw = false;
         lastMinuteTick = millis();
-      } else if (millis() - lastMinuteTick > MINUTE_TICK_MS) {
+      } else if (millis() - lastMinuteTick > ((gpsMode && !hasWallClock) ? GPS_ACQUIRE_REFRESH_MS : MINUTE_TICK_MS)) {
+        // (GPS mode, still waiting for the first fix: refresh every 30 s
+        // instead of every minute so the satellite count / wiring hints
+        // stay reasonably current. The moment the fix lands, gpsOnFix()
+        // flags a redraw by itself — no need to wait for this timer.)
         lastMinuteTick = millis();
+        if (gpsMode && hasWallClock) applyCityTableOffset(); // carries the display across a DST changeover
         updateCountdown();
         if (millis() - lastFullRefreshMs > FULL_REFRESH_INTERVAL_MS) {
           fullRefreshClock(); // periodic ghost-clearing full refresh
